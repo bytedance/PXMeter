@@ -1,9 +1,7 @@
 # Benchmark for Biomolecular Structure Prediction Models
 
-<div align="left" style="margin: 20px 0;">
-<span style="margin: 0 10px;">📄 <a href="URL">From Dataset Diagnostics to Evaluation: Revisiting
-Structure Prediction Benchmarks with PXMeter</a></span>
-</div>
+[From Dataset Curation to Unified Evaluation: Revisiting
+ Structure Prediction Benchmarks with PXMeter](./docs/pxmeter.pdf)
 
 
 This repository provides evaluation codes for assessing models using our curated evaluation sets:
