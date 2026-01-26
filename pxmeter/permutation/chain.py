@@ -348,6 +348,9 @@ class ChainPermutation:
                     common_atoms2,
                 ) = ChainPermutation._align_uni_atom_id_in_chain(atoms1, atoms2)
 
+                if common_atoms1.size == 0:
+                    continue
+
                 center1 = coords1[mask1][common_atoms1].mean(axis=0)
                 center2 = coords2[mask2][common_atoms2].mean(axis=0)
                 dist_mat[
@@ -451,12 +454,18 @@ class ChainPermutation:
                 self.model_struct.uni_atom_id[model_chain_mask],
             )
 
+            if ref_chain_indices.size == 0:
+                continue
+
             ref_chain_coord = aligned_ref_coord[ref_chain_mask][ref_chain_indices]
             model_chain_coord = self.model_struct.atom_array.coord[model_chain_mask][
                 model_chain_indices
             ]
             ref_coords.append(ref_chain_coord)
             model_coords.append(model_chain_coord)
+
+        if not ref_coords:
+            return float("inf")
 
         ref_coords = np.concatenate(ref_coords)
         model_coords = np.concatenate(model_coords)
@@ -486,8 +495,8 @@ class ChainPermutation:
                 - Sorted model atom indices
         """
         ref_mask = np.isin(ref_uni_atom_id, model_uni_atom_id)
-
-        assert np.any(ref_mask), "No common atoms between ref and model chains"
+        if not np.any(ref_mask):
+            return np.array([], dtype=int), np.array([], dtype=int)
 
         ref_indices = np.where(ref_mask)[0]
 
@@ -577,6 +586,9 @@ class ChainPermutation:
                 ref_anchor_uni_atom_id, model_anchor_uni_atom_id
             )
 
+            if ref_chain_indices.size == 0:
+                continue
+
             rot, trans = align_src_to_tar(
                 src_pose=ref_anchor_coord[ref_chain_indices],
                 tar_pose=model_anchor_coord[model_chain_indices],
@@ -647,6 +659,14 @@ class ChainPermutation:
                 self.ref_struct.uni_atom_id[ref_chain_indices],
                 self.model_struct.uni_atom_id[model_chain_indices],
             )
+
+            if ref_chain_aligned_indices.size == 0:
+                logging.warning(
+                    "No atoms were aligned for ref chain %s to model chain %s",
+                    ref_chain_id,
+                    model_chain_id,
+                )
+                continue
 
             ref_align_ratio = len(ref_chain_aligned_indices) / len(ref_chain_indices)
             if ref_align_ratio < 0.5:
