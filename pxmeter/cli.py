@@ -25,7 +25,7 @@ from pxmeter.eval import evaluate, MetricResult
 from pxmeter.input_builder.constants import VALID_INPUT_TYPES, VALID_OUTPUT_TYPES
 from pxmeter.input_builder.gen_input import run_gen_input
 from pxmeter.input_builder.interactive import run_interactive_gen
-from pxmeter.utils import read_chain_id_to_mol_from_json
+from pxmeter.utils import read_chain_id_to_mol_from_json, str_to_none
 
 logging.basicConfig(
     level=logging.INFO,
@@ -160,6 +160,10 @@ def cli(
     Evaluate the performance of a model CIF file by comparing it to a reference CIF file,
     and save the results in a JSON file.
     """
+    # Handle "None" string from CLI
+    ref_assembly_id = str_to_none(ref_assembly_id)
+    interested_lig_label_asym_id = str_to_none(interested_lig_label_asym_id)
+
     if ctx.invoked_subcommand is None:
         if len(sys.argv) == 1:
             click.echo(ctx.get_help())
@@ -295,6 +299,10 @@ def gen_input_cli(
     """
     Generate model inputs.
     """
+    # Handle "None" string from CLI
+    assembly_id = str_to_none(assembly_id)
+    pdb_ids = str_to_none(pdb_ids)
+
     if interactive:
         run_interactive_gen()
         return

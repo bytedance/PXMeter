@@ -14,9 +14,25 @@
 
 import json
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from rdkit import Chem
+
+
+def str_to_none(s: Optional[str]) -> Optional[str]:
+    """
+    Convert string "None" (case-insensitive) to Python None object.
+    Otherwise return the original string.
+
+    Args:
+        s (str | None): Input string.
+
+    Returns:
+        str | None: None if s is "None", else s.
+    """
+    if s is not None and s.lower() == "none":
+        return None
+    return s
 
 
 def read_chain_id_to_mol_from_json(json_f: Union[Path, str]) -> dict[str, Chem.Mol]:

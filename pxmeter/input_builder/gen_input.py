@@ -28,6 +28,7 @@ from pxmeter.input_builder.model_inputs.alphafold3 import AlpahFold3Input
 from pxmeter.input_builder.model_inputs.boltz import BoltzInput
 from pxmeter.input_builder.model_inputs.protenix import ProtenixInput
 from pxmeter.input_builder.seq import Sequences
+from pxmeter.utils import str_to_none
 
 
 def gen_one(
@@ -307,7 +308,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-s",
         "--seeds",
-        type=str,
+        type=str_to_none,
         default=None,
         help=(
             "Comma-separated seeds, e.g. '0,1,2'; required if --num-seeds "
@@ -328,7 +329,7 @@ if __name__ == "__main__":
         "-a",
         "--assembly-id",
         dest="assembly_id",
-        type=str,
+        type=str_to_none,
         default=None,
         help=(
             "Assembly ID in the input CIF file. Defaults to None. "
@@ -340,7 +341,7 @@ if __name__ == "__main__":
         "-p",
         "--pdb-ids",
         dest="pdb_ids",
-        type=str,
+        type=str_to_none,
         default=None,
         help=(
             "PDB IDs as a comma-separated string (e.g. '7n0a,7rss') "
