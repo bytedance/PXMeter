@@ -48,10 +48,10 @@ pxm -r examples/7rss.cif -m examples/7rss_protenix_pred.cif -o pxm_output.json
 **Key Parameters**:
 - `-r` or `--ref_cif`: Path to reference CIF file
 - `-m` or `--model_cif`: Path to model CIF file
-- `-o` or `--output`: Path to save evaluation results (default: "pxm_output.json")
+- `-o` or `--output_json`: Path to save evaluation results (default: "pxm_output.json")
 - `--ref_model`: Specify model number of reference CIF (default: 1)
 - `--ref_assembly_id`: Specify the assembly ID for the reference CIF (default: None; uses the Asymmetric Unit for evaluation)
-- `ref_altloc`: Specify the alternative location identifier for the reference CIF (default: "first", uses the first alternative location code for each residue).
+- `--ref_altloc`: Specify the alternative location identifier for the reference CIF (default: "first", uses the first alternative location code for each residue).
 - `--chain_id_to_mol_json`: JSON file defining custom ligands, where keys are chain IDs (label_asym_id) and values are the corresponding ligand SMILES strings.
 - `-l` or `--interested_lig_label_asym_id`: Indicate the `label_asym_id` of ligands for metrics like pocket-aligned RMSD. Multiple ligands should be comma-separated.
 - `-C key.path=value`: Override fields in `pxmeter.configs.run_config.RUN_CONFIG` (repeatable; e.g., `-C metric.lddt.eps=1e-4 -C mapping.mapping_ligand=false`).
@@ -94,25 +94,46 @@ metric_result = evaluate(
 )
 ```
 
-### Common runtime settings
-These RUN_CONFIG options are often modified depending on the evaluation scenario:
+For a detailed, step-by-step description of the PXMeter runtime evaluation pipeline (mapping, alignment, and metric computation), please refer to the [PXMeter evaluation pipeline details](docs/pxmeter_eval_details.md).
 
-- `mapping.res_id_alignments` — Defaults to True. Matches residues between the reference and model chains directly by res_id,
-which generally requires the two sequences to be identical. Setting this to False switches the residue-matching strategy to sequence alignment.
+For a comprehensive overview of the runtime configuration options, recommended defaults, and advanced usage examples, see the [PXMeter run configuration guide](docs/run_config_details.md).
+
+### Optional: Stereochemistry checks
+
+Run stereochemistry checks for a single CIF and export a CSV report:
+
+```bash
+pxm stereocheck -c examples/7rss_protenix_pred.cif -o stereochem_report.csv
+```
+**`pxm stereocheck` Parameters**:
+- `-c` or `--cif` (required): Path to the CIF file
+- `-o` or `--output-csv`: Path to the output CSV report (default: `stereochem_report.csv`)
 
 
 ## 📊 Benchmarking
-Refer to [benchmark/README.md](./benchmark/README.md) for evaluation protocols on:
-- RecentPDB dataset
-- PoseBusters V2
 
-The benchmark data is released under the CC0 license.
-We include code in the `benchmark` directory that evaluates various models using PXMeter and aggregates their metrics.
-This serves as an example of best practices for using the tool. For more details, please refer to our paper:
+PXMeter offers a reproducible workflow covering both dataset creation and model evaluation.
 
-📄 <a href="https://www.biorxiv.org/content/10.1101/2025.07.17.664878v1">From Dataset Curation to Unified Evaluation: Revisiting
- Structure Prediction Benchmarks with PXMeter</a>
+**Note**: The benchmarking workflow (the `benchmark/` directory) is only available in the source repository and is not shipped with the PyPI package. To run benchmarking, please clone the repository first:
 
+```bash
+git clone https://github.com/bytedance/PXMeter.git
+cd PXMeter
+```
+
+- The **[Benchmark Documentation](docs/benchmark.md)** explains how to run evaluations on model predictions and how the aggregated metrics are computed.
+- The **[Dataset Pipeline Overview](docs/datapipeline.md)** describes the complete construction of the RecentPDB low-homology dataset,
+including filtering, homology scans, clustering, and subset labeling.
+The pipeline also allows users to **rebuild the evaluation dataset from scratch using any custom time window**.
+This makes the benchmark fully flexible and adaptable to different release periods or ongoing updates from the PDB.
+- For details on the dataset used in our paper, please refer to the **[legacy dataset documentation](docs/legacy_dataset_reference.md)**, which describes the dataset version and evaluation code used at the time of the initial release.
+
+## ➡️ Preparing input files
+
+When working with structural inputs—e.g., converting mmCIF, AlpahFold3, Protenix, or Boltz formats—you may find the following utility helpful:
+
+[pxm gen-input Usage Guide](docs/gen_input.md).
+ — a tool for generating and converting model input files via CLI or Python API.
 
 
 ## 💪 Contributing to PXMeter

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import argparse
-import csv
 import json
 import logging
 from pathlib import Path
@@ -21,14 +20,21 @@ from typing import Any
 
 import pandas as pd
 from joblib import delayed, Parallel
-from pxmeter.constants import POLYMER
 from tqdm import tqdm
 
-from benchmark.utils import shrink_dataframe
+from benchmark.utils import add_comp_chain_iface_id, shrink_dataframe
 
-COMPLEX_METRICS = ["lddt", "clashes"]
-CHAIN_METRICS = ["lddt", "ref_pocket_chain", "lig_rmsd_wo_refl", "pocket_rmsd_wo_refl"]
-INTERFACE_METRICS = ["lddt", "dockq"]
+COMPLEX_METRICS = ["lddt", "bb_lddt"]
+CHAIN_METRICS = [
+    "lddt",
+    "bb_lddt",
+    "ref_pocket_chain",
+    "lig_rmsd",
+    "pocket_rmsd",
+    "lig_rmsd_wo_refl",  # legacy
+    "pocket_rmsd_wo_refl",  # legacy
+]
+INTERFACE_METRICS = ["lddt", "bb_lddt", "dockq"]
 
 
 class ResultJsonToDataFrame:
@@ -194,6 +200,16 @@ class ResultJsonToDataFrame:
             )
 
         if "ref_pocket_chain" in metrics_df.columns:
+            # Add ref_pocket_entity
+            metrics_df["ref_pocket_entity"] = metrics_df.apply(
+                lambda row: (
+                    self.ref_chain_id_to_entity_id[row["ref_pocket_chain"]]
+                    if pd.notna(row["ref_pocket_chain"])
+                    else None
+                ),
+                axis=1,
+            )
+
             # Add rankers for ligand-pocket interfaces
             def _add_lig_pocket_ranker(row, ranker_key, mapping):
                 if row["type"] != "chain" or pd.isna(row["ref_pocket_chain"]):
@@ -210,7 +226,9 @@ class ResultJsonToDataFrame:
                         )
                     ]
 
-            for ranker, interface_id_to_score in confidences["interface"].items():
+            for ranker, interface_id_to_score in confidences.get(
+                "interface", {}
+            ).items():
                 metrics_df[ranker] = metrics_df.apply(
                     lambda row, ranker_key=ranker, mapping=interface_id_to_score: _add_lig_pocket_ranker(
                         row, ranker_key, mapping
@@ -295,6 +313,8 @@ def agg_a_single_dir(pdb_dir: Path | str) -> tuple[pd.DataFrame, pd.DataFrame]:
 
             json_to_df = ResultJsonToDataFrame(sample_json, confidence_json)
             metrics_df = json_to_df.get_summary_dataframe()
+            if metrics_df.empty:
+                continue
             metrics_df["seed"] = seed
             metrics_df["sample"] = sample
             all_metrics_df_list.append(metrics_df)
@@ -303,12 +323,14 @@ def agg_a_single_dir(pdb_dir: Path | str) -> tuple[pd.DataFrame, pd.DataFrame]:
             if pb_valid_df is None or pb_valid_df.empty:
                 continue
             pb_valid_df.dropna(axis=1, how="all", inplace=True)
+            if pb_valid_df.empty:
+                continue
             pb_valid_df["seed"] = seed
             pb_valid_df["sample"] = sample
             all_pb_valid_df_list.append(pb_valid_df)
 
     if len(all_metrics_df_list) == 0:
-        logging.warning(f"No metrics found in {pdb_dir}")
+        logging.warning("No metrics found in %s", pdb_dir)
         return pd.DataFrame(), pd.DataFrame()
 
     all_metrics_df = pd.concat(all_metrics_df_list)
@@ -320,103 +342,8 @@ def agg_a_single_dir(pdb_dir: Path | str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return all_metrics_df, all_pb_valid_df
 
 
-def add_cluster_id_to_metrics_df(
-    cluster_csv: Path | str,
-    metrics_df: pd.DataFrame,
-    interface_only_use_polymer_cluster: bool = False,
-) -> pd.DataFrame:
-    """
-    Adds cluster IDs to the metrics DataFrame based on the cluster information in the provided CSV file.
-
-    Args:
-        cluster_csv (Path or str): The path to the CSV file containing cluster information.
-        metrics_df (pd.DataFrame): The DataFrame containing the metrics data.
-        interface_only_use_polymer_cluster (bool, optional): Whether to only use polymer
-                                           cluster for interface evaluation. Defaults to False.
-
-    Returns:
-        pd.DataFrame: The updated DataFrame with cluster IDs added.
-    """
-    # Convert the cluster_csv to a Path object
-    cluster_csv = Path(cluster_csv)
-    cluster_df = pd.read_csv(cluster_csv, dtype=str)
-
-    # Drop rows with NaN values in the "cluster_id" column
-    cluster_df.dropna(subset=["cluster_id"], inplace=True, how="all", axis=0)
-    cluster_key = cluster_df["entry_id"] + "_" + cluster_df["label_entity_id"]
-    entry_entity_to_cluster_id = dict(zip(cluster_key, cluster_df["cluster_id"]))
-
-    def gen_cluster_id(row) -> dict[str, str | None]:
-        """
-        Generates cluster IDs for a given row in the metrics DataFrame.
-
-        Args:
-            row (pd.Series): A row from the metrics DataFrame.
-
-        Returns:
-            dict[str, str | None]: A dictionary containing cluster IDs for the row.
-        """
-        cluster = {}
-        cluster_id_1 = entry_entity_to_cluster_id.get(
-            row["entry_id"] + "_" + str(row["entity_id_1"])
-        )
-        cluster_id_2 = entry_entity_to_cluster_id.get(
-            row["entry_id"] + "_" + str(row["entity_id_2"])
-        )
-
-        if row["type"] == "complex":
-            cluster["cluster_id_1"] = None
-            cluster["cluster_id_2"] = None
-            cluster["cluster_id"] = None
-
-        elif row["type"] == "chain":
-            cluster["cluster_id_1"] = cluster_id_1
-            cluster["cluster_id_2"] = None
-            cluster["cluster_id"] = cluster_id_1
-
-        elif row["type"] == "interface":
-            cluster["cluster_id_1"] = cluster_id_1
-            cluster["cluster_id_2"] = cluster_id_2
-
-            if interface_only_use_polymer_cluster:
-                is_polymer_1 = row["entity_type_1"] in POLYMER
-                is_polymer_2 = row["entity_type_2"] in POLYMER
-                if (is_polymer_1 and is_polymer_2) or (
-                    not is_polymer_1 and not is_polymer_2
-                ):
-                    if cluster_id_1 and cluster_id_2:
-                        cluster["cluster_id"] = ":".join(
-                            sorted([cluster_id_1, cluster_id_2])
-                        )
-                    else:
-                        cluster["cluster_id"] = None
-
-                elif is_polymer_1:
-                    cluster["cluster_id"] = cluster_id_1
-                elif is_polymer_2:
-                    cluster["cluster_id"] = cluster_id_2
-                else:
-                    cluster["cluster_id"] = None
-            else:
-                if cluster_id_1 and cluster_id_2:
-                    # If both cluster IDs are present, join them with a colon
-                    cluster["cluster_id"] = ":".join(
-                        sorted([cluster_id_1, cluster_id_2])
-                    )
-                else:
-                    cluster["cluster_id"] = None
-        return cluster
-
-    metrics_df[["cluster_id_1", "cluster_id_2", "cluster_id"]] = metrics_df.apply(
-        gen_cluster_id, axis=1, result_type="expand"
-    )[["cluster_id_1", "cluster_id_2", "cluster_id"]]
-    return metrics_df
-
-
 def run_aggregator(
     eval_result_dir: Path | str,
-    cluster_csv: Path | str | None = None,
-    interface_only_use_polymer_cluster: bool = False,
     num_cpu: int = -1,
 ):
     """
@@ -429,12 +356,6 @@ def run_aggregator(
     Args:
         eval_result_dir (Path or str): The directory containing the evaluation results.
                         For example: eval_result_dir/[pdb_id]/[seed]/*.json
-        cluster_csv (Path or str, optional): The csv file containing cluster information.
-                    There are 3 columns in csv:
-                    "entry_id", "label_entity_id", "cluster_id"
-                    Defaults to None.
-        interface_only_use_polymer_cluster (bool, optional): Whether to only use polymer
-                                           cluster for interface evaluation. Defaults to False.
         num_cpu (int, optional): The number of CPU cores to use for parallel processing. Defaults to -1.
     """
     eval_result_dir = Path(eval_result_dir)
@@ -461,16 +382,23 @@ def run_aggregator(
     for metrics_df, pb_valid_df in results:
         if not metrics_df.empty:
             metrics_df.dropna(axis=1, how="all", inplace=True)
-            all_metrics_df_list.append(metrics_df)
+            if not metrics_df.empty:
+                all_metrics_df_list.append(metrics_df)
         if not pb_valid_df.empty:
             pb_valid_df.dropna(axis=1, how="all", inplace=True)
-            all_pb_valid_df_list.append(pb_valid_df)
+            if not pb_valid_df.empty:
+                all_pb_valid_df_list.append(pb_valid_df)
 
     if len(all_metrics_df_list) == 0:
         logging.warning("All metrics DataFrame are empty in %s", eval_result_dir)
         return
 
     all_metrics_df = pd.concat(all_metrics_df_list)
+
+    # Add columns "2" if there are only chains
+    for col_name in ["chain_id_2", "entity_id_2", "entity_type_2"]:
+        if col_name not in all_metrics_df.columns:
+            all_metrics_df[col_name] = None
 
     def strfloat_to_strint(x):
         if pd.isna(x):
@@ -487,12 +415,8 @@ def run_aggregator(
         strfloat_to_strint
     )
 
-    if cluster_csv:
-        all_metrics_df = add_cluster_id_to_metrics_df(
-            cluster_csv, all_metrics_df, interface_only_use_polymer_cluster
-        )
-
     output_parquet = eval_result_dir.parent / f"{eval_result_dir.name}_metrics.parquet"
+    all_metrics_df = add_comp_chain_iface_id(all_metrics_df)
     all_metrics_df, _report = shrink_dataframe(all_metrics_df)
     all_metrics_df.to_parquet(
         output_parquet,
@@ -507,6 +431,7 @@ def run_aggregator(
         output_pb_valid_parquet = (
             eval_result_dir.parent / f"{eval_result_dir.name}_pb_valid.parquet"
         )
+        all_pb_valid_df = add_comp_chain_iface_id(all_pb_valid_df)
         all_pb_valid_df, _report = shrink_dataframe(all_pb_valid_df)
         all_pb_valid_df.to_parquet(
             output_pb_valid_parquet,
@@ -529,13 +454,6 @@ if __name__ == "__main__":
         help="Path to the evaluation result directory.",
     )
     parser.add_argument(
-        "-c",
-        "--cluster_csv",
-        type=str,
-        default=None,
-        help="Path to the cluster csv file.",
-    )
-    parser.add_argument(
         "-n",
         "--num_cpu",
         type=int,
@@ -545,6 +463,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    run_aggregator(
-        args.eval_result_dir, cluster_csv=args.cluster_csv, num_cpu=args.num_cpu
-    )
+    run_aggregator(args.eval_result_dir, num_cpu=args.num_cpu)

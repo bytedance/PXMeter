@@ -984,7 +984,7 @@ class MappingResult:
     model_struct: Structure
     mapped_ref_struct: Structure
     mapped_model_struct: Structure
-    chain_mapping: dict[str, str]
+    chain_mapping: dict[str, str]  # ref to model
     chain_mapping_anchors: dict[str, str]
     model_to_ref_entity_id: dict[str, str]
 
@@ -1020,7 +1020,7 @@ class MappingResult:
             ref_model (int): Model number for the reference structure. Defaults to 1.
             model_chain_id_to_lig_mol (dict[str, Chem.Mol], optional): Mapping of model chain IDs
                 to ligand molecules. Defaults to None.
-            chain_mapping (dict[str, str], optional): Mapping of model chain IDs to reference chain IDs.
+            chain_mapping (dict[str, str], optional): Mapping of reference chain IDs to model chain IDs.
                             Defaults to None.
             mapping_config (ConfigDict, optional): Configuration for the mapping process.
                             Defaults to RUN_CONFIG.mapping.

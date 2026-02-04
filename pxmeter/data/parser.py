@@ -44,15 +44,15 @@ from pxmeter.data.ccd import get_ccd_one_letter_code
 
 
 def get_assembly(
-    pdbx_file,
-    assembly_id=None,
-    model=None,
-    data_block=None,
-    altloc="first",
-    extra_fields=None,
-    use_author_fields=True,
-    include_bonds=False,
-):
+    pdbx_file: Union[pdbx.CIFFile, pdbx.CIFBlock],
+    assembly_id: Optional[str] = None,
+    model: Optional[int] = None,
+    data_block: Optional[str] = None,
+    altloc: str = "first",
+    extra_fields: Optional[list[str]] = None,
+    use_author_fields: bool = True,
+    include_bonds: bool = False,
+) -> Union[AtomArray, AtomArrayStack]:
     """
     This code is copied from a Biotite fix commit, as Biotite versions between
     v1.2.0 and v1.5.0 lose inter-chain bonds in the get_assembly function.
@@ -137,9 +137,15 @@ def get_assembly(
         Contains the `sym_id` annotation, which enumerates the copies of the asymmetric
         unit in the assembly.
 
+    Raises
+    ------
+    InvalidFileError
+        If the file has no 'pdbx_struct_assembly_gen' or 'pdbx_struct_oper_list' category.
+    KeyError
+        If the Assembly ID is not present in the file.
+
     Examples
     --------
-
     >>> import os.path
     >>> file = CIFFile.read(os.path.join(path_to_structures, "1f2n.cif"))
     >>> assembly = get_assembly(file, model=1)
@@ -162,10 +168,10 @@ def get_assembly(
     elif assembly_id not in assembly_ids:
         raise KeyError(f"File has no Assembly ID '{assembly_id}'")
 
-    ### Calculate all possible transformations
+    # Calculate all possible transformations
     transformations = _get_transformations(struct_oper_category)
 
-    ### Get structure according to additional parameters
+    # Get structure according to additional parameters
     # Include 'label_asym_id' as annotation array
     # for correct asym ID filtering
     extra_fields = [] if extra_fields is None else extra_fields
@@ -185,7 +191,7 @@ def get_assembly(
         include_bonds,
     )
 
-    ### Get transformations and apply them to the affected asym IDs
+    # Get transformations and apply them to the affected asym IDs
     sub_assemblies = []
     sym_id_counter = Counter()
     for id, op_expr, asym_id_expr in zip(
@@ -418,10 +424,6 @@ class MMCIFParser:
         # build reference entity atom array, including missing residues
         entity_poly_seq = self.get_category_table("entity_poly_seq")
         if entity_poly_seq is None:
-            logging.warning(
-                'The "_entity_poly_seq" is not in the input CIF file：%s',
-                self.mmcif_file,
-            )
             return poly_entity_id_to_res_names
 
         polymer_entities = set(entity_poly_seq["entity_id"])

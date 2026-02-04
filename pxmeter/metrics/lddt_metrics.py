@@ -54,6 +54,9 @@ class LDDT:
         self.eps = eps
         self.lddt_thresholds = lddt_thresholds
 
+        # When stereochecks is enabled, we also cache the underlying violation
+        # DataFrames for downstream reporting.
+        self.stereo_violation_dfs = None
         self.model_atom_mask = (
             self._get_model_stereo_valid_atom_mask() if stereochecks else None
         )
@@ -83,6 +86,8 @@ class LDDT:
             struct=self.model_struct, ref_struct=self.ref_struct
         )
         model_atom_mask = checker.get_valid_atom_mask()
+        # Populated by `StereoChemValidator.get_valid_atom_mask()`.
+        self.stereo_violation_dfs = getattr(checker, "_last_violation_dfs", None)
         return model_atom_mask
 
     @staticmethod
@@ -113,10 +118,7 @@ class LDDT:
             np.ndarray: index of atom pairs [N_pair_sparse, 2]
         """
         ref_coords = self.ref_struct.atom_array.coord
-        nuc_entities = [
-            k for k, v in self.ref_struct.entity_poly_type.items() if v in (DNA, RNA)
-        ]
-        is_nuc = np.isin(self.ref_struct.atom_array.label_entity_id, nuc_entities)
+        is_nuc = self.ref_struct.get_mask_for_given_entity_types([DNA, RNA])
 
         # Restrict to bespoke inclusion radius
         kdtree = KDTree(ref_coords)
@@ -142,10 +144,8 @@ class LDDT:
                 )
             )
 
-        if not all_pairs:
-            raise ValueError("No atom pairs found for LDDT calculation.")
-
         atom_pairs = np.concatenate(all_pairs, axis=0)
+        assert atom_pairs.shape[0] > 0, "No atom pairs found for LDDT calculation."
 
         return atom_pairs
 
@@ -243,8 +243,8 @@ class LDDT:
     ) -> Union[float, list[float]]:
         """
         Run LDDT calculation for complex / chain / interface evaluation.
-        If the evaluation is for whole complex, the chain_1_mask and chain_2_mask are None.
-        If the evaluation is for a single chain, the chain_2_mask is the same as the chain_1_mask.
+        If the evaluation is for whole complex, the chain_1_masks and chain_2_masks are None.
+        If the evaluation is for a single chain, the chain_2_masks is the same as the chain_1_masks.
 
         Args:
             chain_1_masks (np.ndarray, optional): [N_eval, N_atom] Atom mask for chain 1.
@@ -260,7 +260,11 @@ class LDDT:
         """
         eval_chain_interface = chain_1_masks is not None and chain_2_masks is not None
 
-        # Combine user-provided atom_mask and stereochemistry-based model_atom_mask
+        # Apply user-provided atom_mask as a hard filter on atom pairs.
+        #
+        # Note: When `stereochecks=True`, stereochemistry validity is handled by
+        # `self.per_pair_lddt_all` (pairs touching invalid atoms contribute 0),
+        # and we intentionally do NOT drop those pairs here.
         n_atom = self.model_struct.atom_array.coord.shape[0]
         combined_atom_mask = None
         if atom_mask is not None:
@@ -269,12 +273,6 @@ class LDDT:
                 atom_mask.shape[0] == n_atom
             ), f"atom_mask shape mismatch: expected ({n_atom}), got {atom_mask.shape}"
             combined_atom_mask = atom_mask
-
-        if self.model_atom_mask is not None:
-            if combined_atom_mask is None:
-                combined_atom_mask = self.model_atom_mask
-            else:
-                combined_atom_mask = combined_atom_mask & self.model_atom_mask
 
         if not eval_chain_interface:
             pair_indices = np.arange(len(self.lddt_atom_pair))

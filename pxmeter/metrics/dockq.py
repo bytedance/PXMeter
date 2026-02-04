@@ -251,6 +251,24 @@ def compute_dockq_for_pair(
         return {}
 
     # 2. Aligned residues
+    def get_all_residues(struct, chain):
+        mask = struct.uni_chain_id == chain
+        starts = struct.get_residue_starts(add_exclusive_stop=True)
+        indices = np.where(mask)[0]
+        if len(indices) == 0:
+            return []
+        first, last = indices[0], indices[-1]
+        res_list = []
+        for start, stop in zip(starts[:-1], starts[1:]):
+            if start >= first and stop <= last + 1:
+                res_list.append((start, stop))
+        return res_list
+
+    ref_all1 = get_all_residues(ref_struct, ref_chain1)
+    model_all1 = get_all_residues(model_struct, model_chain1)
+    ref_all2 = get_all_residues(ref_struct, ref_chain2)
+    model_all2 = get_all_residues(model_struct, model_chain2)
+
     if align_atoms:
         ref_aln1, model_aln1 = _get_aligned_residues(
             ref_struct, ref_chain1, model_struct, model_chain1
@@ -260,23 +278,10 @@ def compute_dockq_for_pair(
         )
     else:
         # Assume residues are already aligned in order
-        def get_all_residues(struct, chain):
-            mask = struct.uni_chain_id == chain
-            starts = struct.get_residue_starts(add_exclusive_stop=True)
-            indices = np.where(mask)[0]
-            if len(indices) == 0:
-                return []
-            first, last = indices[0], indices[-1]
-            res_list = []
-            for start, stop in zip(starts[:-1], starts[1:]):
-                if start >= first and stop <= last + 1:
-                    res_list.append((start, stop))
-            return res_list
-
-        ref_aln1 = get_all_residues(ref_struct, ref_chain1)
-        model_aln1 = get_all_residues(model_struct, model_chain1)
-        ref_aln2 = get_all_residues(ref_struct, ref_chain2)
-        model_aln2 = get_all_residues(model_struct, model_chain2)
+        ref_aln1 = ref_all1
+        model_aln1 = model_all1
+        ref_aln2 = ref_all2
+        model_aln2 = model_all2
 
     if not ref_aln1 or not ref_aln2 or not model_aln1 or not model_aln2:
         return {}
@@ -333,7 +338,7 @@ def compute_dockq_for_pair(
 
     # 4. LRMSD
     # Assign receptor and ligand by size (DockQ convention)
-    if len(ref_aln1) > len(ref_aln2):
+    if len(ref_all1) > len(ref_all2):
         receptor_ref, receptor_model = ref_aln1, model_aln1
         ligand_ref, ligand_model = ref_aln2, model_aln2
         class1, class2 = "receptor", "ligand"
@@ -352,12 +357,16 @@ def compute_dockq_for_pair(
 
     # Align on receptor
     if len(ref_rec_coords) == 0:
-        lrmsd = 0.0
+        raise ValueError(
+            "No common backbone atoms found in receptor for LRMSD calculation."
+        )
     else:
         rot_rec, trans_rec = align_src_to_tar(model_rec_coords, ref_rec_coords)
         # Apply to ligand and compute RMSD
         if len(ref_lig_coords) == 0:
-            lrmsd = 0.0
+            raise ValueError(
+                "No common backbone atoms found in ligand for LRMSD calculation."
+            )
         else:
             model_lig_rotated = apply_transform(model_lig_coords, rot_rec, trans_rec)
             lrmsd = rmsd(model_lig_rotated, ref_lig_coords)

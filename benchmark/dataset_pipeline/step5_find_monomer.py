@@ -21,12 +21,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from joblib import Parallel, delayed
+from joblib import delayed, Parallel
+from pxmeter.constants import LIGAND, PROTEIN, RNA
+from pxmeter.data.struct import Structure
 from tqdm import tqdm
 
-from benchmark.configs.data_config import SUPPORTED_DATA
-from pxmeter.constants import LIGAND, PROTEIN
-from pxmeter.data.struct import Structure
+from benchmark.configs.data_config import PXM_MMCIF_DIR, SRC_DATA, SUPPORTED_DATA
 
 
 def get_entity_counts_from_cif(
@@ -45,10 +45,13 @@ def get_entity_counts_from_cif(
     cif_path = Path(cif_path)
     pdb_id = cif_path.stem
 
-    structure = Structure.from_mmcif(cif_path, altloc="all", assembly_id=assembly_id)
+    structure = Structure.from_mmcif(cif_path, altloc="first", assembly_id=assembly_id)
+    structure = structure.clean_structure(remove_crystallization_aids=False)
+
     meta_info = {"entry_id": pdb_id}
 
-    entity_type_chains_count = Counter()
+    entity_type_chain_count = Counter()
+    entity_type_entity_count = Counter()
     for label_entity_id in np.unique(structure.atom_array.label_entity_id):
         entity_type = structure.entity_poly_type.get(label_entity_id, LIGAND)
         label_asym_ids = np.unique(
@@ -57,9 +60,11 @@ def get_entity_counts_from_cif(
             ]
         )
         chains = len(label_asym_ids)
-        entity_type_chains_count[entity_type] += chains
+        entity_type_chain_count[entity_type] += chains
+        entity_type_entity_count[f"{entity_type} entities"] += 1
 
-    meta_info.update(entity_type_chains_count)
+    meta_info.update(entity_type_chain_count)
+    meta_info.update(entity_type_entity_count)
     return meta_info
 
 
@@ -93,7 +98,7 @@ def get_entity_counts_from_cif_batch(
         random.seed(42)
         random.shuffle(all_cif_paths)
     else:
-        all_cif_paths = [i for i in cif_dir.glob("*.cif") if i.stem in pdb_ids]
+        all_cif_paths = [cif_dir / f"{i}.cif" for i in pdb_ids]
 
     if n_cpu == 1:
         all_meta_info = [
@@ -112,6 +117,7 @@ def get_entity_counts_from_cif_batch(
                     for cif_path in all_cif_paths
                 ),
                 total=len(all_cif_paths),
+                desc="Get Entity counts from CIFs",
             )
         ]
     counts_df = pd.DataFrame(all_meta_info)
@@ -129,7 +135,7 @@ def get_entity_counts_from_cif_batch(
     return counts_df
 
 
-def find_protein_monomer(df: pd.DataFrame) -> pd.DataFrame:
+def find_monomer_and_homomer(df: pd.DataFrame) -> pd.DataFrame:
     """
     Identifies protein monomers in a DataFrame based on the
     presence of polypeptide chains and absence of other entities (ligand not include).
@@ -145,7 +151,7 @@ def find_protein_monomer(df: pd.DataFrame) -> pd.DataFrame:
     def _check_is_protein_monomer(row):
         for col in df.columns:
             # Monomer include ligand
-            if col in ["entry_id", PROTEIN, LIGAND]:
+            if col in ["entry_id", PROTEIN, LIGAND] or col.endswith(" entities"):
                 continue
             if row[col] > 0:
                 return False
@@ -155,20 +161,55 @@ def find_protein_monomer(df: pd.DataFrame) -> pd.DataFrame:
         else:
             return False
 
+    def _check_is_protein_homomer(row):
+        for col in df.columns:
+            if col in ["entry_id", f"{PROTEIN} entities"] or (
+                not col.endswith(" entities")
+            ):
+                continue
+            if row[col] > 0:
+                return False
+
+        if row[PROTEIN] > 1 and row[f"{PROTEIN} entities"] == 1:
+            return True
+        else:
+            return False
+
+    def _check_is_rna_monomer(row):
+        for col in df.columns:
+            # Monomer include ligand
+            if col in ["entry_id", RNA, LIGAND] or col.endswith(" entities"):
+                continue
+            if row[col] > 0:
+                return False
+
+        if row[RNA] == 1:
+            return True
+        else:
+            return False
+
     df["is_protein_monomer"] = df.apply(_check_is_protein_monomer, axis=1)
+    df["is_protein_homomer"] = df.apply(_check_is_protein_homomer, axis=1)
+    df["is_rna_monomer"] = df.apply(_check_is_rna_monomer, axis=1)
     return df
 
 
 def find_protein_monomer_for_recentpdb_lowh(
-    lowh_csv: Path, mmcif_dir: Path, output_csv: Path, n_cpu: int = -1
+    mmcif_dir: Path,
+    lowh_csv: Path,
+    output_csv: Path,
+    assembly_id: str = "1",
+    n_cpu: int = -1,
 ):
     """
     Identifies protein monomers in the RecentPDB dataset and saves the results to a CSV file.
 
     Args:
-        lowh_csv (Path): The path to the CSV file containing the RecentPDB dataset.
         mmcif_dir (Path): The path to the directory containing the MMCIF files.
+        lowh_csv (Path): The path to the CSV file containing the RecentPDB dataset.
         output_csv (Path): The path to the output CSV file.
+        assembly_id (str, optional): The assembly ID to extract from the CIF files.
+                    If None, the Asym Unit will be used.
         n_cpu (int, optional): The number of CPU cores to use for parallel processing. Defaults to 1.
     """
     df = pd.read_csv(
@@ -178,14 +219,16 @@ def find_protein_monomer_for_recentpdb_lowh(
     pdb_ids = set(df["entry_id"])
 
     counts_df = get_entity_counts_from_cif_batch(
-        cif_dir=mmcif_dir, pdb_ids=pdb_ids, assembly_id="1", n_cpu=n_cpu
+        cif_dir=mmcif_dir, pdb_ids=pdb_ids, assembly_id=assembly_id, n_cpu=n_cpu
     )
-    counts_df = find_protein_monomer(counts_df)
+    counts_df = find_monomer_and_homomer(counts_df)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
     counts_df.to_csv(output_csv, index=False, quoting=csv.QUOTE_NONNUMERIC)
 
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
+    argparser.add_argument("-m", "--mmcif_dir", type=Path, default=PXM_MMCIF_DIR)
     argparser.add_argument(
         "-l",
         "--lowh_csv",
@@ -193,16 +236,16 @@ if __name__ == "__main__":
         default=Path(SUPPORTED_DATA.recentpdb_low_homology),
     )
     argparser.add_argument(
-        "-m",
-        "--mmcif_dir",
-        type=Path,
-        default=Path(SUPPORTED_DATA.true_dir),
-    )
-    argparser.add_argument(
         "-o",
         "--output_csv",
         type=Path,
-        default=Path(SUPPORTED_DATA.recentpdb_low_homology_entity_type_count),
+        default=Path(SRC_DATA.recentpdb_low_homology_entity_type_count),
+    )
+    argparser.add_argument(
+        "-a",
+        "--assembly_id",
+        type=str,
+        default="1",
     )
     argparser.add_argument(
         "-n",
@@ -214,8 +257,9 @@ if __name__ == "__main__":
     args = argparser.parse_args()
 
     find_protein_monomer_for_recentpdb_lowh(
-        lowh_csv=args.lowh_csv,
         mmcif_dir=args.mmcif_dir,
+        lowh_csv=args.lowh_csv,
         output_csv=args.output_csv,
+        assembly_id=args.assembly_id,
         n_cpu=args.n_cpu,
     )

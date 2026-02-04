@@ -22,16 +22,9 @@ from typing import Any
 
 import numpy as np
 from joblib import Parallel, delayed
-from rdkit import Chem
-from rdkit.Chem import AllChem
 from tqdm import tqdm
 
-from benchmark.configs.rankers_config import MODEL_TO_RANKER_KEYS
-from benchmark.utils import (
-    divide_list_into_chunks,
-    int_to_letters,
-    nested_dict_to_sorted_list,
-)
+from benchmark.utils import divide_list_into_chunks, nested_dict_to_sorted_list
 from pxmeter.configs.run_config import RUN_CONFIG
 from pxmeter.eval import evaluate
 
@@ -80,7 +73,11 @@ class BaseEvaluator:
         self.pdb_id_to_altloc = pdb_id_to_altloc
         self.pdb_ids_list = pdb_ids_list
         self.chunk_str = chunk_str
-        self.ranker = MODEL_TO_RANKER_KEYS.nan
+        self.ranker = {
+            "complex": [],
+            "chain": [],
+            "interface": [],
+        }
         self.eval_run_config = RUN_CONFIG
 
     def _filter_each_data(self, each_data: list):
@@ -140,47 +137,21 @@ class BaseEvaluator:
         return filtered_data
 
     def _get_info_from_each_pdb_dir(self, pdb_dir: Path) -> list:
-        if not pdb_dir.is_dir():
-            return []
+        """
+        Extract evaluation task information from a single PDB prediction directory.
 
-        name = pdb_dir.stem
-        pdb_id = name.split("_")[0]
+        This method must be implemented by subclasses to handle different model output structures.
 
-        if (pdb_dir / pdb_id).exists():
-            pdb_dir = pdb_dir / pdb_id
+        Args:
+            pdb_dir (Path): The directory containing predictions for a specific PDB.
 
-        sub_data = []
-        for seed_dir in pdb_dir.iterdir():
-            seed = seed_dir.name.replace("seed_", "")
-
-            # e.g. 5sak_summary_confidence_confidences_sample_0.json
-            sample_to_confidence_path = {
-                json_f.stem.split("_")[-1]: json_f
-                for json_f in (seed_dir / "predictions").glob("*sample_*.json")
-            }
-
-            # e.g. 5sak_sample_0.cif
-            for pred_cif in (seed_dir / "predictions").glob("*sample_*.cif"):
-                sample = pred_cif.stem.split("_")[-1]
-                confidence_json = sample_to_confidence_path.get(sample)
-                if confidence_json is None:
-                    logging.warning(
-                        "Cannot find confidence json for %s, skip.", pred_cif
-                    )
-                    continue
-                model_chain_id_to_lig_mol = None
-                sub_data.append(
-                    (
-                        name,
-                        pdb_id,
-                        seed,
-                        sample,
-                        pred_cif,
-                        confidence_json,
-                        model_chain_id_to_lig_mol,
-                    )
-                )
-        return sub_data
+        Returns:
+            list[tuple]: A list of tuples containing (name, pdb_id, seed, sample, pred_cif,
+                         confidence_json, model_chain_id_to_lig_mol).
+        """
+        raise NotImplementedError(
+            "_get_info_from_each_pdb_dir must be implemented by subclasses"
+        )
 
     def load_all_cif_and_confidence(self) -> list[tuple[Any]]:
         """
@@ -338,8 +309,12 @@ class BaseEvaluator:
                     ] = this_interface_score
         ranker_results["interface"] = interface_ranker_results
 
-        with open(output_confidence_json, "w") as f:
+        output_confidence_tmp_json = Path(output_confidence_json).with_suffix(
+            ".json.tmp"
+        )
+        with open(output_confidence_tmp_json, "w") as f:
             json.dump(ranker_results, f, indent=4)
+        output_confidence_tmp_json.rename(output_confidence_json)
 
     def _get_output_path(self, name, seed, sample) -> tuple[Path, Path]:
         """
@@ -358,6 +333,20 @@ class BaseEvaluator:
             self.output_dir / name / seed / f"sample_{sample}_confidences.json"
         )
         return metric_json, confidence_json
+
+    def run_eval_for_one_pdb_dir(self, pdb_dir: Path):
+        """
+        Run evaluation for a single PDB prediction directory.
+
+        This method extracts the necessary information from the PDB directory
+        and calls the `run_eval` method to perform the evaluation.
+
+        Args:
+            pdb_dir (Path): The directory containing predictions for a specific PDB.
+        """
+        tasks = self._get_info_from_each_pdb_dir(pdb_dir)
+        for task in tasks:
+            self.run_eval(task)
 
     def run_eval(self, task: tuple[str, ...]):
         """
@@ -389,18 +378,18 @@ class BaseEvaluator:
         )
 
         if self.pdb_id_to_lig_label_asym_id and pdb_id == "8f4j":
-            # For PoseBusters only
+            # For PoseBusters of PXM-Legacy only
             true_cif = self.true_dir / f"{pdb_id}_cropped.cif"
 
         if self.pdb_id_to_lig_label_asym_id:
-            interested_lig_label_asym_id = self.pdb_id_to_lig_label_asym_id[pdb_id]
+            interested_lig_label_asym_id = self.pdb_id_to_lig_label_asym_id.get(pdb_id)
             if isinstance(interested_lig_label_asym_id, str):
                 interested_lig_label_asym_id = interested_lig_label_asym_id.split(",")
         else:
             interested_lig_label_asym_id = None
 
         if self.pdb_id_to_altloc:
-            ref_altloc = self.pdb_id_to_altloc[pdb_id]
+            ref_altloc = self.pdb_id_to_altloc.get(pdb_id, "first")
         else:
             ref_altloc = "first"
 
@@ -417,10 +406,7 @@ class BaseEvaluator:
 
             output_metric_json.parent.mkdir(parents=True, exist_ok=True)
 
-            # Output to a *.json.tmp file, then rename to *.json
-            output_metric_tmp_json = output_metric_json.with_suffix(".json.tmp")
-            metric_result.to_json(json_file=output_metric_tmp_json)
-            output_metric_tmp_json.rename(output_metric_json)
+            metric_result.to_json(json_file=output_metric_json)
 
             self.save_mapped_confidence_json(
                 rankers=self.ranker,
@@ -482,323 +468,3 @@ class BaseEvaluator:
         else:
             for task in tqdm(data, total=len(data), desc="Evaluating"):
                 self.run_eval(task)
-
-
-class ProtenixEvaluator(BaseEvaluator):
-    """
-    A class for evaluating protein structures using the Protenix model.
-    """
-
-    def __init__(
-        self,
-        true_dir: Path | str,
-        pred_dir: Path | str,
-        output_dir: Path | str,
-        num_cpu: int = 1,
-        overwrite: bool = False,
-        ref_assembly_id: str | None = None,
-        pdb_id_to_lig_label_asym_id: dict[str, str | list] | None = None,
-        pdb_id_to_altloc: dict[str, str] | None = None,
-        pdb_ids_list: list | None = None,
-        chunk_str: str | None = None,
-    ):
-        super().__init__(
-            true_dir,
-            pred_dir,
-            output_dir,
-            num_cpu,
-            overwrite,
-            ref_assembly_id,
-            pdb_id_to_lig_label_asym_id,
-            pdb_id_to_altloc,
-            pdb_ids_list,
-            chunk_str,
-        )
-        self.ranker = MODEL_TO_RANKER_KEYS.protenix
-
-
-class BoltzEvaluator(BaseEvaluator):
-    """
-    A class for evaluating protein structures using the Boltz model.
-    """
-
-    def __init__(
-        self,
-        true_dir: Path | str,
-        pred_dir: Path | str,
-        output_dir: Path | str,
-        num_cpu: int = 1,
-        overwrite: bool = False,
-        ref_assembly_id: str | None = None,
-        pdb_id_to_lig_label_asym_id: dict[str, str | list] | None = None,
-        pdb_id_to_altloc: dict[str, str] | None = None,
-        pdb_ids_list: list | None = None,
-        chunk_str: str | None = None,
-    ):
-        super().__init__(
-            true_dir,
-            pred_dir,
-            output_dir,
-            num_cpu,
-            overwrite,
-            ref_assembly_id,
-            pdb_id_to_lig_label_asym_id,
-            pdb_id_to_altloc,
-            pdb_ids_list,
-            chunk_str,
-        )
-        self.ranker = MODEL_TO_RANKER_KEYS.boltz
-
-    def _get_info_from_each_pdb_dir(self, pdb_dir: Path) -> list:
-        if not pdb_dir.is_dir():
-            return []
-
-        name = pdb_dir.stem
-        pdb_id = name.split("_")[0]
-
-        sub_data = []
-        for seed_dir in pdb_dir.iterdir():
-            seed = seed_dir.name.replace("seed_", "")
-
-            # e.g. confidence_6st5_model_0.json
-            sample_to_confidence_path = {
-                json_f.stem.split("_")[-1]: json_f
-                for json_f in (
-                    seed_dir / f"boltz_results_{pdb_id}" / "predictions" / pdb_id
-                ).glob("*model_*.json")
-            }
-
-            # e.g. 6st5_model_0.cif
-            for pred_cif in (
-                seed_dir / f"boltz_results_{pdb_id}" / "predictions" / pdb_id
-            ).glob("*model_*.cif"):
-                sample = pred_cif.stem.split("_")[-1]
-                confidence_json = sample_to_confidence_path.get(sample)
-                if confidence_json is None:
-                    logging.warning(
-                        "Cannot find confidence json for %s, skip.", pred_cif
-                    )
-                    continue
-                model_chain_id_to_lig_mol = None
-
-                sub_data.append(
-                    (
-                        name,
-                        pdb_id,
-                        seed,
-                        sample,
-                        pred_cif,
-                        confidence_json,
-                        model_chain_id_to_lig_mol,
-                    )
-                )
-        return sub_data
-
-
-class ChaiEvaluator(BaseEvaluator):
-    """
-    A class for evaluating protein structures using the Chai model.
-    """
-
-    def __init__(
-        self,
-        true_dir: Path | str,
-        pred_dir: Path | str,
-        output_dir: Path | str,
-        num_cpu: int = 1,
-        overwrite: bool = False,
-        ref_assembly_id: str | None = None,
-        pdb_id_to_lig_label_asym_id: dict[str, str | list] | None = None,
-        pdb_id_to_altloc: dict[str, str] | None = None,
-        pdb_ids_list: list | None = None,
-        chunk_str: str | None = None,
-        input_fasta_dir: Path | str | None = None,
-    ):
-        super().__init__(
-            true_dir,
-            pred_dir,
-            output_dir,
-            num_cpu,
-            overwrite,
-            ref_assembly_id,
-            pdb_id_to_lig_label_asym_id,
-            pdb_id_to_altloc,
-            pdb_ids_list,
-            chunk_str,
-        )
-        self.input_fasta_dir = Path(input_fasta_dir) if input_fasta_dir else None
-        self.ranker = MODEL_TO_RANKER_KEYS.chai
-
-    @staticmethod
-    def _get_mols_from_chai_fasta(fasta_file: Path | str) -> dict[str, Chem.Mol]:
-        """
-        Reads a FASTA file and extracts ligand information to create a
-        dictionary of ligand chain IDs to RDKit molecule objects.
-
-        Args:
-            fasta_file (str): The path to the FASTA file.
-
-        Returns:
-            dict: A dictionary mapping ligand chain IDs to RDKit molecule objects.
-        """
-        with open(fasta_file, "r") as f:
-            lines = f.readlines()
-
-        lig_chain_id_to_mol = {}
-        for idx, line in enumerate(lines):
-            if line.startswith(">ligand"):
-                smi = lines[idx + 1].strip()
-                chain_id = int_to_letters(idx // 2 + 1)
-                mol = Chem.MolFromSmiles(smi)
-
-                # remove all Hs from mol (e.g. ZRY in 5sak)
-                mol = AllChem.RemoveAllHs(mol)
-
-                lig_chain_id_to_mol[chain_id] = mol
-        return lig_chain_id_to_mol
-
-    def _get_info_from_each_pdb_dir(self, pdb_dir: Path) -> list:
-        if not pdb_dir.is_dir():
-            return []
-
-        name = pdb_dir.stem
-        pdb_id = name.split("_")[0]
-
-        sub_data = []
-        for seed_dir in pdb_dir.iterdir():
-            seed = seed_dir.name.replace("seed_", "")
-
-            # e.g. scores.model_idx_0.json
-            sample_to_confidence_path = {
-                json_f.stem.split("_")[-1]: json_f
-                for json_f in seed_dir.glob("scores.model_idx_*.json")
-            }
-
-            # e.g. pred.model_idx_0.cif
-            for pred_cif in (seed_dir).glob("pred.model_idx_*.cif"):
-                sample = pred_cif.stem.split("_")[-1]
-                confidence_json = sample_to_confidence_path.get(sample)
-                if confidence_json is None:
-                    logging.warning(
-                        "Can not find confidence file for %s, skip.", pred_cif
-                    )
-                    continue
-
-                if self.input_fasta_dir is None:
-                    model_chain_id_to_lig_mol = None
-                else:
-                    fasta_file = self.input_fasta_dir / f"{pdb_id}.fasta"
-                    if not fasta_file.exists():
-                        logging.warning(
-                            "Fasta file %s does not exist",
-                            fasta_file,
-                        )
-                        model_chain_id_to_lig_mol = None
-                    else:
-                        model_chain_id_to_lig_mol = self._get_mols_from_chai_fasta(
-                            fasta_file
-                        )
-
-                sub_data.append(
-                    (
-                        name,
-                        pdb_id,
-                        seed,
-                        sample,
-                        pred_cif,
-                        confidence_json,
-                        model_chain_id_to_lig_mol,
-                    )
-                )
-        return sub_data
-
-
-class AF2MultimerEvaluator(BaseEvaluator):
-    """
-    A class for evaluating protein structures using the AF2-Multimer model.
-    """
-
-    def __init__(
-        self,
-        true_dir: Path | str,
-        pred_dir: Path | str,
-        output_dir: Path | str,
-        num_cpu: int = 1,
-        overwrite: bool = False,
-        ref_assembly_id: str | None = None,
-        pdb_id_to_lig_label_asym_id: dict[str, str | list] | None = None,
-        pdb_id_to_altloc: dict[str, str] | None = None,
-        pdb_ids_list: list | None = None,
-        chunk_str: str | None = None,
-    ):
-        super().__init__(
-            true_dir,
-            pred_dir,
-            output_dir,
-            num_cpu,
-            overwrite,
-            ref_assembly_id,
-            pdb_id_to_lig_label_asym_id,
-            pdb_id_to_altloc,
-            pdb_ids_list,
-            chunk_str,
-        )
-        self.ranker = MODEL_TO_RANKER_KEYS.af2m
-
-    def _get_info_from_each_pdb_dir(self, pdb_dir: Path) -> list:
-        if not pdb_dir.is_dir():
-            return []
-
-        name = pdb_dir.stem
-        pdb_id = name.split("_")[0]
-
-        if (pdb_dir / pdb_id).exists():
-            pdb_dir = pdb_dir / pdb_id
-
-        debug_file = pdb_dir / "ranking_debug.json"
-        if not debug_file.exists():
-            return []
-        with open(debug_file) as f:
-            confidence_dict = json.load(f)
-
-        # e.g. unrelaxed_model_1_multimer_v3_pred_0.cif
-        sub_data = []
-        for pred_cif in pdb_dir.glob("unrelaxed_model_*.cif"):
-            split_filename = pred_cif.stem.split("_")
-            sample, seed = split_filename[2], split_filename[-1]
-
-            model_name = pred_cif.stem.replace("unrelaxed_", "")
-            confidence_score = confidence_dict["iptm+ptm"][model_name]
-            model_chain_id_to_lig_mol = None
-
-            sub_data.append(
-                (
-                    name,
-                    pdb_id,
-                    seed,
-                    sample,
-                    pred_cif,
-                    confidence_score,  # return confidence score instead of confidence json
-                    model_chain_id_to_lig_mol,
-                )
-            )
-        return sub_data
-
-    @staticmethod
-    def save_mapped_confidence_json(
-        rankers: dict[str, list[tuple[str, bool]]],
-        ori_confidence_json: str | Path,
-        output_confidence_json: str | Path,
-        ori_model_chain_ids: list[str],
-    ):
-        """
-        Derived from BaseEvaluator. Only save "iptm+ptm" score.
-        The "ori_confidence_json" is "iptm+ptm" score read from the ranking_debug.json file.
-        """
-        # complex: {key: score}
-        ranker_results = {}
-        complex_ranker_results = {}
-        complex_ranker_results["iptm+ptm"] = ori_confidence_json
-        ranker_results["complex"] = complex_ranker_results
-        with open(output_confidence_json, "w") as f:
-            json.dump(ranker_results, f, indent=4)

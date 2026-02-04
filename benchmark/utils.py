@@ -13,12 +13,16 @@
 # limitations under the License.
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import numpy as np
 import pandas as pd
-from scipy.stats import binomtest, bootstrap
+from scipy import stats
+
+from benchmark.configs.eval_type_config import EVAL_TYPE_TO_ENTITIY_TYPES
+from pxmeter.constants import POLYMER
 
 
 def divide_list_into_chunks(lst: list, n: int) -> list[list]:
@@ -103,7 +107,23 @@ def get_infer_cif_path(
     Raises:
         NotImplementedError: If the provided model name is not recognized.
     """
-    if model == "protenix":
+    if model == "af3":
+        if (infer_output_dir / entry_id / entry_id).exists():
+            cif_path = (
+                infer_output_dir
+                / entry_id
+                / entry_id
+                / f"seed-{seed}_sample-{sample}"
+                / f"{entry_id}_seed-{seed}_sample-{sample}_model.cif"
+            )
+        else:
+            cif_path = (
+                infer_output_dir
+                / entry_id
+                / f"seed-{seed}_sample-{sample}"
+                / f"{entry_id}_seed-{seed}_sample-{sample}_model.cif"
+            )
+    elif model == "protenix":
         cif_path = (
             infer_output_dir
             / entry_id
@@ -150,6 +170,232 @@ def get_eval_result_json_path(
     return eval_result_dir / entry_id / str(seed) / f"sample_{sample}_metrics.json"
 
 
+def build_case_study_samples(
+    details_df: pd.DataFrame,
+    infer_output_dir: Path,
+    eval_result_dir: Path,
+    output_dir: Path,
+    true_cif_dir: Path,
+    model=str,
+    seed_col: str = "seed",
+    sample_col: str = "sample",
+):
+    """
+    Create per-entry study case directories with symlinked inference, ground-truth, and evaluation files.
+
+    Iterates over rows of an input DataFrame and, for each row, constructs a subdirectory
+    under output_dir for the corresponding entry (and chain pair). It then creates
+    symbolic links to the model inference mmCIF, the ground-truth mmCIF, and the
+    evaluation JSON file inside that subdirectory. Designed to gather files needed
+    for manual inspection or downstream case-by-case analysis.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing study-case metadata. Each row must
+                        include at least the columns:
+                        - "entry_id" (str): PDB entry identifier (used as a directory name).
+                        - "chain_id_1" (str): First chain identifier.
+                        - "chain_id_2" (str | NaN): Second chain identifier or NaN if absent.
+                        - seed_col (str, optional): Column name for the random seed (default "seed").
+                        - sample_col (str, optional): Column name for the sample index (default "sample").
+        infer_output_dir (Path): Directory root where inference mmCIF files are stored.
+                                get_infer_cif_path(infer_output_dir, model, entry_id, seed, sample) is
+                                used to resolve the inference file path.
+        eval_result_dir (Path): Directory root where per-sample evaluation JSON files are stored.
+                        get_eval_result_json_path(eval_result_dir, entry_id, seed, sample) is used to
+                        resolve the evaluation file path.
+        output_dir (Path): Root directory under which per-entry study case subdirectories
+                            will be created. Subdirectories take the form:
+                            output_dir / entry_id / "{chain_id_1}" or
+                            output_dir / entry_id / "{chain_id_1}_{chain_id_2}".
+        true_cif_dir (Path): Directory containing ground-truth mmCIF files named {entry_id}.cif.
+        model (str): Model identifier passed to get_infer_cif_path to locate inference results.
+        seed_col (str, optional): Name of the DataFrame column holding the seed value.
+                                Defaults to "seed".
+        sample_col (str, optional): Name of the DataFrame column holding the sample index.
+                                Defaults to "sample".
+    """
+    for _, row in details_df.iterrows():
+        entry_id = row["entry_id"]
+        chain_id_1 = row["chain_id_1"]
+        chain_id_2 = row["chain_id_2"]
+        seed = row[seed_col]
+        sample = row[sample_col]
+        infer_cif_path = get_infer_cif_path(
+            infer_output_dir, model, entry_id, seed, sample
+        )
+        eval_result_json_path = get_eval_result_json_path(
+            eval_result_dir, entry_id, seed, sample
+        )
+        true_cif_path = true_cif_dir / f"{entry_id}.cif"
+
+        if pd.isna(chain_id_2):
+            sub_output_dir = output_dir / entry_id / f"{chain_id_1}"
+        else:
+            sub_output_dir = output_dir / entry_id / f"{chain_id_1}_{chain_id_2}"
+
+        sub_output_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            os.symlink(true_cif_path, output_dir / entry_id / true_cif_path.name)
+        except FileExistsError:
+            pass
+        os.symlink(infer_cif_path, sub_output_dir / f"seed{seed}_{infer_cif_path.name}")
+        os.symlink(
+            eval_result_json_path,
+            sub_output_dir / f"seed{seed}_{eval_result_json_path.name}",
+        )
+
+
+def select_df_by_eval_types(df: pd.DataFrame, eval_types: list[str]) -> pd.DataFrame:
+    """
+    Selects a subset of the DataFrame based on the specified evaluation types.
+    The DataFrame must have following columns:
+    - "type": The type of the evaluation, either "chain" or "interface".
+    - "entity_type_1": The entity type of the first entity.
+    - "entity_type_2": The entity type of the second entity.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing the data.
+        eval_types (list[str]): A list of evaluation types to consider.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing the subset of metrics
+                      data that matches the specified evaluation types.
+    """
+    mask = np.zeros(len(df), dtype=bool)
+    for eval_type in eval_types:
+        entity_type = EVAL_TYPE_TO_ENTITIY_TYPES[eval_type]
+        if eval_type.startswith("Intra-"):
+            # chain
+            entity_type_mask = df.apply(
+                lambda row, e_type=entity_type: str(row["entity_type_1"]) == e_type[0]
+                and row["type"] == "chain",
+                axis=1,
+            )
+        else:
+            # interface
+            entity_type = sorted(entity_type)
+            entity_type_mask = df.apply(
+                lambda row, e_type=entity_type: sorted(
+                    [
+                        str(row["entity_type_1"]),
+                        str(row["entity_type_2"]),
+                    ]
+                )
+                == e_type
+                and row["type"] == "interface",
+                axis=1,
+            )
+        mask |= entity_type_mask
+
+    subset_df = df[mask].copy()
+    return subset_df
+
+
+def query_subset_labels(subset_series: pd.Series, query_label: str) -> pd.Series:
+    """
+    Query the labels of a subset series.
+
+    For example, if the subset series is
+    ["[antibody_HL];[antibody]", "[antibody_H];[antibody]", "[antibody_L];[antibody]"],
+
+    and the query label is "[antibody_HL]", then the returned mask series is
+    [True, False, False].
+
+    Args:
+        subset_series (pd.Series): The series containing the subset labels.
+        query_label (str): The label to query.
+
+    Returns:
+        pd.Series: The mask series indicating whether each label is in the queried label.
+    """
+    mask = subset_series.str.contains(query_label, regex=False) | (
+        subset_series == query_label
+    )
+    return mask
+
+
+def add_comp_chain_iface_id(
+    df: pd.DataFrame,
+    entry_col: str = "entry_id",
+    chain1_col: str = "chain_id_1",
+    chain2_col: str = "chain_id_2",
+    id_col: str = "id",
+) -> pd.DataFrame:
+    """
+    Add an ID column based on whether chain_id_1 / chain_id_2 are present.
+
+    Rules:
+        - If both chain_id_1 and chain_id_2 are "empty" -> id = entry_id
+        - If chain_id_1 is non-empty and chain_id_2 is empty -> id = entry_id + "_" + chain_id_1
+        - If both chain_id_1 and chain_id_2 are non-empty (interface) ->
+              sort(chain1, chain2) and use:
+              id = entry_id + "_" + chain_min + "_" + chain_max
+
+    "Empty" includes NaN, empty string "", and string forms like "nan", "NaN", "None".
+    """
+    out = df.copy()
+
+    for col in (entry_col, chain1_col):
+        if col not in out.columns:
+            raise KeyError(f"Column '{col}' not found in DataFrame.")
+
+    c1 = out[chain1_col].astype(str)
+
+    if chain2_col not in out.columns:
+        c2 = pd.Series("None", index=out.index)
+    else:
+        c2 = out[chain2_col].astype(str)
+
+    def normalize_chain(s: pd.Series) -> pd.Series:
+        s = s.fillna("")  # NaN -> ""
+        s = s.str.strip()
+        s = s.replace({"nan": "", "NaN": "", "None": "", "<NA>": ""})
+        return s
+
+    c1_norm = normalize_chain(c1)
+    c2_norm = normalize_chain(c2)
+
+    c1_empty = c1_norm == ""
+    c2_empty = c2_norm == ""
+
+    mask_complex = c1_empty & c2_empty
+    mask_chain = ~c1_empty & c2_empty
+    mask_iface = ~c1_empty & ~c2_empty
+
+    if id_col in out.columns:
+        # Drop the existing id_col if it exists
+        out = out.drop(columns=[id_col])
+
+    out.insert(0, id_col, "")
+    entry_str = out[entry_col].astype(str)
+
+    # complex: entry_id
+    out.loc[mask_complex, id_col] = entry_str[mask_complex]
+
+    # chain: entry_id_chain1
+    out.loc[mask_chain, id_col] = entry_str[mask_chain] + "_" + c1_norm[mask_chain]
+
+    # interface: entry_id_min(chain1, chain2)_max(chain1, chain2)
+    if mask_iface.any():
+        c1_iface = c1_norm[mask_iface]
+        c2_iface = c2_norm[mask_iface]
+
+        c1_le_c2 = c1_iface <= c2_iface
+        first = pd.Series(
+            np.where(c1_le_c2, c1_iface, c2_iface),
+            index=c1_iface.index,
+        )
+        second = pd.Series(
+            np.where(c1_le_c2, c2_iface, c1_iface),
+            index=c1_iface.index,
+        )
+
+        out.loc[mask_iface, id_col] = entry_str[mask_iface] + "_" + first + "_" + second
+
+    return out
+
+
 def get_bootstrap_ci(
     data: list[float],
     statistic: Callable[[np.ndarray], float] = np.mean,
@@ -167,20 +413,28 @@ def get_bootstrap_ci(
         tuple[float, float]: The lower and upper bounds of the confidence interval.
     """
     if len(data) == 0:
-        logging.warning(
+        logging.debug(
             "Data is empty, cannot calculate confidence \
                 interval for bootstrap. return (0, 0)"
         )
         ci_lower, ci_upper = 0.0, 0.0
     elif len(data) == 1:
-        logging.warning(
+        logging.debug(
             "Data has only one element, cannot calculate confidence \
                 interval for bootstrap. return (data[0], data[0])"
         )
         ci_lower, ci_upper = data[0], data[0]
+
+    elif np.nanstd(data) == 0:
+        logging.debug(
+            "Data has 0 std, cannot calculate confidence \
+                interval for bootstrap. return (data[0], data[0])"
+        )
+        ci_lower, ci_upper = data[0], data[0]
+
     else:
         data = (data,)
-        bootstrap_result = bootstrap(data, statistic, n_resamples=n)
+        bootstrap_result = stats.bootstrap(data, statistic, n_resamples=n)
 
         ci_lower, ci_upper = bootstrap_result.confidence_interval
     return round(ci_lower, 4), round(ci_upper, 4)
@@ -198,9 +452,274 @@ def get_binomial_ci(total_num: int, success_num: int) -> tuple[float, float]:
     Returns:
         tuple[float, float]: The lower and upper bounds of the confidence interval.
     """
-    binomtest_result = binomtest(success_num, total_num).proportion_ci(0.95)
+    binomtest_result = stats.binomtest(success_num, total_num).proportion_ci(0.95)
     ci_lower, ci_upper = binomtest_result
     return round(ci_lower, 4), round(ci_upper, 4)
+
+
+def add_cluster_id_to_df(
+    cluster_df: pd.DataFrame,
+    df: pd.DataFrame,
+    interface_only_use_polymer_cluster: bool = False,
+) -> pd.DataFrame:
+    """
+    Adds cluster IDs to the DataFrame based on the cluster information in the provided CSV file.
+
+    Args:
+        cluster_df (pd.DataFrame): The DataFrame containing cluster information.
+        df (pd.DataFrame): The DataFrame containing the data to add cluster IDs to.
+        interface_only_use_polymer_cluster (bool, optional): Whether to only use polymer
+                                           cluster for interface evaluation. Defaults to False.
+
+    Returns:
+        pd.DataFrame: The updated DataFrame with cluster IDs added.
+    """
+    out = df.copy()
+
+    # Drop rows with NaN values in the "cluster_id" column
+    cdf = cluster_df.dropna(subset=["cluster_id"]).copy()
+
+    key = cdf["entry_id"].astype(str) + "_" + cdf["label_entity_id"].astype(str)
+    entry_entity_to_cluster = dict(zip(key, cdf["cluster_id"].astype(str)))
+
+    key1 = out["entry_id"].astype(str) + "_" + out["entity_id_1"].astype(str)
+    cluster_id_1 = key1.map(entry_entity_to_cluster).astype(object)
+
+    key2 = out["entry_id"].astype(str) + "_" + out["entity_id_2"].astype(str)
+    cluster_id_2 = key2.map(entry_entity_to_cluster).astype(object)
+
+    out["cluster_id_1"] = cluster_id_1
+    out["cluster_id_2"] = cluster_id_2
+
+    has_c1 = out["cluster_id_1"].notna() & (out["cluster_id_1"] != "")
+    has_c2 = out["cluster_id_2"].notna() & (out["cluster_id_2"] != "")
+    both = has_c1 & has_c2
+
+    c1s = out["cluster_id_1"].fillna("")
+    c2s = out["cluster_id_2"].fillna("")
+
+    c1_le_c2 = c1s <= c2s
+    pair_joined = np.where(
+        c1_le_c2,
+        (c1s + ":" + c2s),
+        (c2s + ":" + c1s),
+    )
+    pair_joined = pd.Series(pair_joined, index=out.index).where(both, None)
+
+    types = out.get("type", pd.Series([""] * len(out), index=out.index)).astype(str)
+
+    # chain -> cluster_id_1
+    mask_chain = types == "chain"
+    # interface -> pair_joined
+    mask_interface = types == "interface"
+
+    final_cluster = pd.Series([None] * len(out), index=out.index, dtype=object)
+    final_cluster = final_cluster.where(~mask_chain, out["cluster_id_1"])
+
+    # interface:
+    if interface_only_use_polymer_cluster:
+        is_poly1 = out["entity_type_1"].isin(POLYMER)
+        is_poly2 = out["entity_type_2"].isin(POLYMER)
+
+        # case both polymer or both non-polymer -> use pair_joined if both exist
+        both_poly_or_both_non = (is_poly1 & is_poly2) | (~is_poly1 & ~is_poly2)
+        mask_use_pair = mask_interface & both_poly_or_both_non & both
+        final_cluster = final_cluster.where(~mask_use_pair, pair_joined)
+
+        # case only polymer_1 -> use cluster_id_1
+        mask_use_c1 = mask_interface & is_poly1 & ~is_poly2
+        final_cluster = final_cluster.where(~mask_use_c1, out["cluster_id_1"])
+
+        # case only polymer_2 -> use cluster_id_2
+        mask_use_c2 = mask_interface & is_poly2 & ~is_poly1
+        final_cluster = final_cluster.where(~mask_use_c2, out["cluster_id_2"])
+
+        if "ref_pocket_entity" in out.columns:
+            # pocket-aligned rmsd: use ref_pocket_cluster_id if exist
+            key_pocket = (
+                out["entry_id"].astype(str) + "_" + out["ref_pocket_entity"].astype(str)
+            )
+            cluster_id_pocket = key_pocket.map(entry_entity_to_cluster).astype(object)
+            out["ref_pocket_cluster_id"] = cluster_id_pocket
+            has_pocket = out["ref_pocket_entity"].notna()
+            final_cluster = final_cluster.where(
+                ~has_pocket, out["ref_pocket_cluster_id"]
+            )
+
+        # other interface cases leave None (already None)
+    else:
+        # not restricting by polymer: if both cluster ids exist, use joined, else None
+        mask_use_pair = mask_interface & both
+        final_cluster = final_cluster.where(~mask_use_pair, pair_joined)
+
+    # complex remain None (already default)
+    # assign final_cluster
+    out["cluster_id"] = final_cluster
+    return out
+
+
+def paired_test_auto(
+    A: list[float],
+    B: list[float],
+    alpha: float = 0.05,
+    alternative: str = "two-sided",
+    normality_test: bool = True,
+    min_n_for_t: int = 10,
+    shapiro_max_n: int = 5000,
+) -> dict:
+    """
+    Automatically choose between paired t-test (for approximately normal differences)
+    and Wilcoxon signed-rank test (for non-normal differences).
+
+    Always uses d = A - B as the difference direction, so effect_size > 0 means A > B.
+
+    Args:
+        A, B : array-like
+            Two paired samples of equal length.
+        alpha : float, optional
+            Significance level, by default 0.05.
+        alternative : {"two-sided", "greater", "less"}, optional
+            Alternative hypothesis.
+            - "greater": test mean(A-B) > 0  (A > B)
+            - "less":    test mean(A-B) < 0  (B > A)
+            - "two-sided": test mean(A-B) != 0
+        normality_test : bool, optional
+            Whether to run Shapiro-Wilk test on differences to check normality.
+        min_n_for_t : int, optional
+            Minimum sample size to allow t-test. For very small n, Wilcoxon is safer.
+        shapiro_max_n : int, optional
+            Maximum n to run Shapiro test. If n is larger, skip Shapiro and default to t-test.
+
+    Returns
+        dict: A dictionary containing:
+            - n : sample size
+            - alternative : alternative hypothesis used
+            - mean_diff : mean of A - B
+            - sd_diff : standard deviation of A - B
+            - method : "paired t-test" or "wilcoxon"
+            - stat : test statistic
+            - p : p-value
+            - effect_size : Cohen's d (paired) or rank-biserial correlation
+            - effect_name : name of the effect size metric
+            - decision : "A > B", "B > A", or "no significant difference"
+    """
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
+    assert (
+        A.shape == B.shape and A.ndim == 1
+    ), "A and B must be 1D arrays of the same length."
+
+    # Remove NaNs
+    mask = ~(np.isnan(A) | np.isnan(B))
+    A, B = A[mask], B[mask]
+    n = len(A)
+
+    d = A - B
+    mean_d = float(np.mean(d))
+    sd_d = float(np.std(d, ddof=1)) if n > 1 else 0.0
+
+    result = {
+        "n": n,
+        "alternative": alternative,
+        "mean_diff": mean_d,
+        "sd_diff": sd_d,
+        "method": None,
+        "stat": None,
+        "p": None,
+        "effect_size": None,
+        "effect_name": None,  # "cohen_d_paired" or "rank_biserial"
+        "decision": "no significant difference",  # "A > B" / "B > A" / "no significant difference"
+    }
+
+    if n < 3:
+        result["decision"] = "Sample size too small (n < 3)"
+        return result
+
+    # -------- Normality check --------
+    use_ttest = True
+    if normality_test and (3 <= n <= shapiro_max_n):
+        try:
+            _shapiro_stat, shapiro_p = stats.shapiro(d)
+            # If Shapiro test not rejected, and n is large enough, use t-test
+            use_ttest = (shapiro_p >= alpha) and (n >= min_n_for_t)
+        except Exception:
+            # If Shapiro fails (e.g. constant vector), fall back to heuristic
+            use_ttest = n >= min_n_for_t
+    else:
+        use_ttest = n >= min_n_for_t
+
+    # -------- Run significance test + effect size --------
+    if use_ttest and sd_d > 0:
+        # Paired t-test
+        t_stat, p = stats.ttest_rel(A, B, alternative=alternative)
+        # Cohen's d for paired samples
+        cohen_d = abs(mean_d / sd_d)
+        result.update(
+            {
+                "method": "paired t-test",
+                "stat": float(t_stat),
+                "p": float(p),
+                "effect_size": float(cohen_d),
+                "effect_name": "cohen_d_paired",
+            }
+        )
+    else:
+        # Wilcoxon signed-rank test
+        if np.allclose(d, 0):
+            # All differences are zero -> no effect
+            result.update(
+                {
+                    "method": "wilcoxon",
+                    "stat": 0.0,
+                    "p": 1.0,
+                    "effect_size": 0.0,
+                    "effect_name": "rank_biserial",
+                    "decision": "no significant difference",
+                }
+            )
+            return result
+
+        w_stat, p = stats.wilcoxon(
+            d, zero_method="wilcox", alternative=alternative, correction=False
+        )
+
+        # Rank-biserial correlation
+        nonzero = d[d != 0]
+        ranks = stats.rankdata(np.abs(nonzero))
+        pos = nonzero > 0
+        w_pos = ranks[pos].sum()
+        w_neg = ranks[~pos].sum()
+        denom = len(nonzero) * (len(nonzero) + 1) / 2.0
+        r_rb = abs((w_pos - w_neg) / denom) if denom > 0 else 0.0
+
+        result.update(
+            {
+                "method": "wilcoxon",
+                "stat": float(w_stat),
+                "p": float(p),
+                "effect_size": float(r_rb),
+                "effect_name": "rank_biserial",
+            }
+        )
+
+    # -------- Decision based on p-value and direction --------
+    alt = alternative
+    p = result["p"]
+    if alt == "two-sided":
+        if p < alpha:
+            result["decision"] = "A > B" if mean_d > 0 else "B > A"
+        else:
+            result["decision"] = "no significant difference"
+    elif alt == "greater":
+        # H1: mean(A-B) > 0
+        result["decision"] = "A > B" if p < alpha else "no significant difference"
+    elif alt == "less":
+        # H1: mean(A-B) < 0
+        result["decision"] = "B > A" if p < alpha else "no significant difference"
+    else:
+        raise ValueError('alternative must be "two-sided", "greater", or "less".')
+
+    return result
 
 
 def fmt_bytes(n: int) -> str:
@@ -301,9 +820,9 @@ def shrink_dataframe(
         if bool_cast:
             if pd.api.types.is_bool_dtype(s):
                 pass  # already boolean
-            elif set(np.unique(s.dropna().values)).issubset(
-                {0, 1}
-            ) and not pd.api.types.is_float_dtype(s):
+            elif set(s.dropna()).issubset({0, 1}) and not pd.api.types.is_float_dtype(
+                s
+            ):
                 out[col] = s.astype("boolean") if s.isna().any() else s.astype(bool)
                 changes[col] = (old_dtype, out[col].dtype)
                 continue
@@ -325,7 +844,10 @@ def shrink_dataframe(
         elif use_nullable_int and s.dtype == "object":
             sample = s.sample(min(len(s), 5000), random_state=0)
             try_parse = pd.to_numeric(sample, errors="coerce", downcast="integer")
-            if try_parse.notna().mean() > 0.98 and (try_parse % 1 == 0).all():
+            if (
+                try_parse.notna().equals(sample.notna())
+                and (try_parse.dropna() % 1 == 0).all()
+            ):
                 parsed = pd.to_numeric(s, errors="coerce", downcast="integer")
                 if parsed.isna().any():
                     # Choose the smallest nullable integer dtype that can hold the range.

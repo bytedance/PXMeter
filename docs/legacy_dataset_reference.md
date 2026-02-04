@@ -6,13 +6,16 @@
 </div>
 
 
+‼️**This document describes the dataset provided in the initial PXMeter release (the PXM-Legacy dataset). The evaluation results in this version were generated using the PXMeter code at commit 9830335c68d0c918f7776ad58946cfa5e7690e16.**
+
+---
+
 This repository provides evaluation codes for assessing models using our curated evaluation sets:
 | Dataset       | Description                                                                                                  | Metrics                             |
 |---------------|--------------------------------------------------------------------------------------------------------------|-------------------------------------|
-| RecentPDB     | Evaluates RecentPDB low homology protein subset. Antibody-antigen and monomer subsets reported separately.   | DockQ success rates (>0.23), LDDT   |
-| AF3-AB        | Analyses antibody-antigen subset of AlphaFold3.                                                              | DockQ success rates (>0.23), LDDT   |
-| RecentPDB-NA  | Focuses on low homology nucleic acids subset of RecentPDB, aggregating LDDT for intra-DNA chains, intra-RNA chains, DNA-protein, and RNA-protein interfaces. | LDDT                                |
-| dsDNA-Protein | Focuses on intra-DNA chains and DNA-protein interfaces, aggregating LDDT metrics.                            | LDDT                                |
+| RecentPDB     | Evaluates RecentPDB low homology subset. Antibody-antigen and monomer subsets reported separately.   | DockQ success rates (>0.23), LDDT   |
+| AF3-AB        | Analyses antibody-antigen subset of AlphaFold3.                                                              | DockQ success rates (>0.23), LDDT   |                             |
+| dsDNA-Protein | Focuses on intra-DNA chains and DNA-Protein interfaces, aggregating LDDT metrics.                            | LDDT                                |
 | RNA-Protein   | Evaluates intra-DNA chains and RNA-protein interfaces with LDDT aggregation.                                 | LDDT                                |
 | PoseBusters   | Assesses pocket-aligned RMSD of small molecules (PoseBusters V2).                                            | RMSD success rates (< 2 Å)          |
 
@@ -48,7 +51,7 @@ python benchmark/run_eval.py -i [infer_dir] -o [output_dir] -d [dataset] -c [chu
 
 - `infer_dir`: Directory containing inference results (CIF files and confidence files).
 - `output_dir`: Directory where evaluation results will be saved.
-- `dataset`: Dataset to evaluate (options: "RecentPDB", "RecentPDB-NA", "PoseBusters", "dsDNA-Protein", "RNA-Protein", "AF3-AB").
+- `dataset`: Dataset to evaluate (options: "RecentPDB", "PoseBusters", "dsDNA-Protein", "RNA-Protein", "AF3-AB").
 - `chunk_str`: Chunk string for distributed evaluation (e.g., '1of5'), used when running evaluations across multiple machines. The default is None.
 - `model`: Model name should be one of the supported options: "protenix", "boltz", "chai" or "af2m", as defined in "benchmark.run_eval.run_batch_eval", which calls corresponding Evaluators.
 - `num_cpu`: Number of CPU cores to use. Default is 1.
@@ -64,7 +67,6 @@ Example JSON structure:
     "seeds": [101, 102, "..."],
     "dataset_path": {
       "RecentPDB": "path/to/eval_results/RecentPDB",
-      "RecentPDB-NA": "path/to/eval_results/RecentPDB_NA",
       "PoseBusters": "path/to/eval_results/PoseBusters",
       "AF3-AB": "path/to/eval_results/AF3_AB"
     }
@@ -73,7 +75,7 @@ Example JSON structure:
 ```
 
 Allowed keys for `dataset_path` are:
-`"RecentPDB"`, `"RecentPDB-NA"`, `"PoseBusters"`, `"dsDNA-Protein"`, `"RNA-Protein"`, and `"AF3-AB"`.
+`"RecentPDB"`, `"PoseBusters"`, `"dsDNA-Protein"`, `"RNA-Protein"`, and `"AF3-AB"`.
 Each dataset can include only a subset of these keys.
 
 

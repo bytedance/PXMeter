@@ -109,6 +109,9 @@ class ResiduePermutation:
         if not np.any(mask):
             return
 
+        if arr.bonds is None:
+            return
+
         bond_arr = arr.bonds[mask].as_array()
 
         res_id_i = arr.res_id[mask][bond_arr[:, 0]]
@@ -139,7 +142,7 @@ class ResiduePermutation:
             for node in G.nodes:
                 node_res_name = arr.res_name[mask][arr.res_id[mask] == node][0]
                 node_atom_names = "_".join(
-                    arr.atom_name[mask][arr.res_id[mask] == node]
+                    sorted(arr.atom_name[mask][arr.res_id[mask] == node])
                 )
 
                 if node == 1:
@@ -194,13 +197,30 @@ class ResiduePermutation:
         chain_mask = self.model_struct.uni_chain_id == chain_id
 
         # Use the residue 1 as the root
-        root_coord_mask = chain_mask & (self.model_struct.atom_array.res_id == 1)
-        model_root = self.model_struct.atom_array.coord[root_coord_mask]
-        ref_root = self.ref_struct.atom_array.coord[root_coord_mask]
-        if (len(model_root) == 0) or (len(ref_root) == 0):
+        model_root_idx = np.where(
+            chain_mask & (self.model_struct.atom_array.res_id == 1)
+        )[0]
+        ref_root_idx = np.where(chain_mask & (self.ref_struct.atom_array.res_id == 1))[
+            0
+        ]
+
+        model_names = self.model_struct.atom_array.atom_name[model_root_idx]
+        ref_names = self.ref_struct.atom_array.atom_name[ref_root_idx]
+
+        # Get common atoms and align them by atom name to remove order dependency.
+        # np.intersect1d returns sorted common_names, so the coordinates extracted
+        # using model_comm_idx and ref_comm_idx will follow the same atom-name order.
+        common_names, model_comm_idx, ref_comm_idx = np.intersect1d(
+            model_names, ref_names, return_indices=True
+        )
+
+        # For a stable 3D rigid body alignment (rotation + translation),
+        # at least 3 atoms are required.
+        if len(common_names) < 3:
             return
 
-        assert model_root.shape == ref_root.shape
+        model_root = self.model_struct.atom_array.coord[model_root_idx[model_comm_idx]]
+        ref_root = self.ref_struct.atom_array.coord[ref_root_idx[ref_comm_idx]]
 
         rot, trans = align_src_to_tar(model_root, ref_root)
 

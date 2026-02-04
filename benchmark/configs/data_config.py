@@ -13,81 +13,46 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 
 from ml_collections import ConfigDict
 
-PXM_EVAL_DATA_ROOT_PATH = os.environ.get("PXM_EVAL_DATA_ROOT_PATH", "evaluation")
+PXM_EVAL_DATA_ROOT_PATH = Path(
+    os.environ.get(
+        "PXM_EVAL_DATA_ROOT_PATH",
+        "evaluation",
+    )
+)
 
-_TMP_EVAL_RESULTS = {
-    "boltz-1": {
-        "model": "boltz",
-        "seeds": [101, 102, 103, 104, 105],
-        "dataset_path": {
-            "RecentPDB": "eval_results/boltz-1/RecentPDB",
-            "PoseBusters": "eval_results/boltz-1/PoseBusters",
-            "AF3-AB": "eval_results/boltz-1/AF3_AB",
-        },
-    },
-    "chai-1": {
-        "model": "chai",
-        "seeds": [101, 102, 103, 104, 105],
-        "dataset_path": {
-            "RecentPDB": "eval_results/chai-1/RecentPDB",
-            "PoseBusters": "eval_results/chai-1/PoseBusters",
-            "AF3-AB": "eval_results/chai-1/AF3_AB",
-        },
-    },
-    "protenix": {
-        "model": "protenix",
-        "seeds": [101, 102, 103, 104, 105],
-        "dataset_path": {
-            "RecentPDB": "eval_results/protenix/RecentPDB",
-            "PoseBusters": "eval_results/protenix/PoseBusters",
-            "AF3-AB": "eval_results/protenix/AF3_AB",
-            "RecentPDB-NA": "eval_results/protenix/RecentPDB_NA",
-        },
-    },
+SUPPORT_DATA_DIR = PXM_EVAL_DATA_ROOT_PATH / "supported_data"
+SRC_DATA_DIR = PXM_EVAL_DATA_ROOT_PATH / "src_data"
+
+
+_SUPPORTED_DATA_NAME = {
+    "true_dir": "mmcif",
+    "recentpdb_low_homology_cluster": "RecentPDB_low_homology_cluster_info.csv",
+    "recentpdb_low_homology": "RecentPDB_low_homology.csv",
+    "lig_info_csv": "RecentPDB_low_homology_lig_info.csv",
+    "af3_ab_metadata": "af3_metadata_antibody_antigen.csv",
+    "recentpdb_low_homology_entity_homo_parquet": "RecentPDB_low_homology_entity_homo.parquet",
 }
 
-_TMP_SUPPORTED_DATA = {
-    "true_dir": "supported_data/mmcif",
-    "pb_true_dir": "supported_data/posebusters_mmcif",
-    "pb_info_csv": "supported_data/posebusters_lig_info.csv",
-    "pdb_cluster_file": "supported_data/clusters-by-entity-40.txt",
-    "recentpdb_low_homology_cluster": "supported_data/RecentPDB_low_homology_cluster_info.csv",
-    "recentpdb_low_homology": "supported_data/RecentPDB_protein_low_homology.csv",
-    "recentpdb_low_homology_entity_type_count": "supported_data/RecentPDB_low_homology_entity_types_count.csv",
-    "recentpdb_na_cluster": "supported_data/RecentPDB_NA_cluster_info.csv",
-    "recentpdb_na_low_homology": "supported_data/RecentPDB_NA_low_homology.csv",
-    "af3_ab_metadata": "supported_data/af3_metadata_antibody_antigen.csv",
+_SRC_DATA_NAME = {
+    "pdb_meta_info": "pdb_meta_info.csv",
+    "pdb_seq_csv": "pdb_seqs.csv",
+    "recentpdb_chain_interface_csv": "RecentPDB_chain_interface.csv",
+    "recentpdb_low_homology_entity_type_count": "RecentPDB_low_homology_entity_types_count.csv",
+    "ccd_to_similar_ccds": "ccd_to_similar_ccds.json",
+    "test_to_train_entity_homo_parquet": "test_to_train_entity_homo.parquet",
+    "sabdab_summary_file": "sabdab_summary_all.tsv",
 }
-
-_TMP_SRC_DATA = {
-    "pdb_meta_info": "supported_data/pdb_meta_info.csv",
-    "recentpdb_chain_interface_csv": "supported_data/RecentPDB_chain_interface.csv",
-    "test_to_train_entity_homo_json": "supported_data/test_to_train_entity_homo.json",
-}
-
-# Add PXM_EVAL_DATA_ROOT_PATH to the dataset_path
-EVAL_RESULTS = {}
-for k, v in _TMP_EVAL_RESULTS.items():
-    EVAL_RESULTS[k] = {
-        "model": v["model"],
-        "seeds": v["seeds"],
-        "dataset_path": {
-            k: os.path.join(PXM_EVAL_DATA_ROOT_PATH, v["dataset_path"][k])
-            for k in v["dataset_path"]
-        },
-    }
 
 SUPPORTED_DATA = ConfigDict(
-    {
-        k: os.path.join(PXM_EVAL_DATA_ROOT_PATH, v)
-        for k, v in _TMP_SUPPORTED_DATA.items()
-    }
+    {k: SUPPORT_DATA_DIR / v for k, v in _SUPPORTED_DATA_NAME.items()}
 )
 
 
-SRC_DATA = ConfigDict(
-    {k: os.path.join(PXM_EVAL_DATA_ROOT_PATH, v) for k, v in _TMP_SRC_DATA.items()}
-)
+SRC_DATA = ConfigDict({k: SRC_DATA_DIR / v for k, v in _SRC_DATA_NAME.items()})
+
+
+PXM_MMCIF_DIR = Path(os.environ.get("PXM_MMCIF_DIR", SUPPORTED_DATA.true_dir))

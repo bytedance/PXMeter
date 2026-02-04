@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from collections import defaultdict
 from typing import Sequence
 
@@ -23,8 +22,8 @@ from benchmark.configs.eval_type_config import (
     EVAL_TYPE_TO_ENTITIY_TYPES,
     PB_VALID_CHECK_COL,
 )
-from benchmark.configs.rankers_config import MODEL_TO_RANKER_KEYS
-from benchmark.utils import get_binomial_ci, get_bootstrap_ci
+from benchmark.evaluators import MODEL_TO_RANKER_KEYS
+from benchmark.utils import get_binomial_ci, get_bootstrap_ci, select_df_by_eval_types
 
 
 class ChainInterfaceDisplayer:
@@ -46,51 +45,6 @@ class ChainInterfaceDisplayer:
         self.metrics_df = metrics_df
         self.seeds = [str(i) for i in seeds] if seeds else None
         self.ranker_keys = MODEL_TO_RANKER_KEYS.get(model, MODEL_TO_RANKER_KEYS["nan"])
-
-    @staticmethod
-    def select_df_by_eval_types(
-        metrics_df: pd.DataFrame, eval_types: list[str]
-    ) -> pd.DataFrame:
-        """
-        Selects a subset of the metrics DataFrame based on the specified evaluation types.
-
-        Args:
-            metrics_df (pd.DataFrame): The DataFrame containing the metrics data.
-            eval_types (list[str]): A list of evaluation types to consider.
-
-        Returns:
-            pd.DataFrame: A DataFrame containing the subset of metrics
-                          data that matches the specified evaluation types.
-        """
-        mask = np.zeros(len(metrics_df), dtype=bool)
-        for eval_type in eval_types:
-            entity_type = EVAL_TYPE_TO_ENTITIY_TYPES[eval_type]
-            if eval_type.startswith("Intra-"):
-                # chain
-                entity_type_mask = metrics_df.apply(
-                    lambda row, e_type=entity_type: str(row["entity_type_1"])
-                    == e_type[0]
-                    and row["type"] == "chain",
-                    axis=1,
-                )
-            else:
-                # interface
-                entity_type = sorted(entity_type)
-                entity_type_mask = metrics_df.apply(
-                    lambda row, e_type=entity_type: sorted(
-                        [
-                            str(row["entity_type_1"]),
-                            str(row["entity_type_2"]),
-                        ]
-                    )
-                    == e_type
-                    and row["type"] == "interface",
-                    axis=1,
-                )
-            mask |= entity_type_mask
-
-        subset_metrics_df = metrics_df[mask].copy()
-        return subset_metrics_df
 
     def _get_group_agg_funcs(
         self,
@@ -134,18 +88,24 @@ class ChainInterfaceDisplayer:
 
     def get_dockq_sr_by_cluster(
         self,
-        eval_types: list[str],
+        eval_types: list[str] | None = None,
         mask_on_metrics_df: Sequence[bool] | None = None,
-        success_threshold=0.23,
+        success_threshold: float = 0.23,
+        subset_name: str = "All",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Calculate the average DockQ score and success rate for each cluster.
 
         Args:
+            eval_types (list[str] | None, optional): A list of evaluation types to consider.
+                        Defaults to None.
             mask_on_metrics_df (Sequence[bool], optional): A boolean mask to apply to the metrics DataFrame.
-            eval_types (list[str]): A list of evaluation types to consider.
+                        Defaults to None.
             success_threshold (float): The threshold for considering a DockQ score as a success.
                               Default is 0.23.
+            subset_name (str, optional): The name of the subset.
+                        It will be added to the "subset" column of result DataFrame.
+                        Defaults to 'All'.
 
         Returns:
             tuple[pd.DataFrame, pd.DataFrame]: A tuple containing two DataFrames:
@@ -153,8 +113,16 @@ class ChainInterfaceDisplayer:
                 - dockq_details_df: A DataFrame containing the details of each sample, including the seed, sample,
                                     ranker, eval type, entry ID, chain ID, cluster ID, and DockQ score.
         """
-        if not eval_types:
-            raise ValueError("At least one eval type must be provided.")
+        if "dockq" not in self.metrics_df.columns:
+            # single chain only
+            return pd.DataFrame(), pd.DataFrame()
+
+        if eval_types is not None:
+            all_eval_types = {
+                k: v for k, v in EVAL_TYPE_TO_ENTITIY_TYPES.items() if k in eval_types
+            }
+        else:
+            all_eval_types = EVAL_TYPE_TO_ENTITIY_TYPES
 
         if mask_on_metrics_df is not None:
             metrics_df = self.metrics_df[mask_on_metrics_df].copy()
@@ -162,7 +130,6 @@ class ChainInterfaceDisplayer:
             metrics_df = self.metrics_df.copy()
 
         if len(metrics_df) == 0:
-            logging.warning("No data found for the given metrics_df.")
             return pd.DataFrame(), pd.DataFrame()
 
         if "cluster_id" not in metrics_df.columns:
@@ -186,8 +153,8 @@ class ChainInterfaceDisplayer:
 
         dockq_results = []
         dockq_details = []
-        for eval_type in eval_types:
-            eval_df = self.select_df_by_eval_types(metrics_df, [eval_type])
+        for eval_type in all_eval_types:
+            eval_df = select_df_by_eval_types(metrics_df, [eval_type])
             if len(eval_df) == 0:
                 # No data for this eval type
                 continue
@@ -251,12 +218,16 @@ class ChainInterfaceDisplayer:
                 dockq_results.append(dockq_result)
         dockq_results_df = pd.DataFrame(dockq_results)
         dockq_details_df = pd.DataFrame(dockq_details)
+
+        dockq_results_df["subset"] = subset_name
+        dockq_details_df["subset"] = subset_name
         return dockq_results_df, dockq_details_df
 
     def get_lddt_by_cluster(
         self,
         eval_types: list[str] | None = None,
         mask_on_metrics_df: Sequence[bool] | None = None,
+        subset_name: str = "All",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Calculate the average LDDT score for each cluster.
@@ -265,6 +236,9 @@ class ChainInterfaceDisplayer:
             eval_types (list[str], optional): A list of evaluation types to consider.
             mask_on_metrics_df (Sequence[bool], optional): A boolean mask to
                                apply to the metrics DataFrame.
+            subset_name (str, optional): The name of the subset.
+                        It will be added to the "subset" column of result DataFrame.
+                        Defaults to 'All'.
 
         Returns:
             tuple[pd.DataFrame, pd.DataFrame]: A tuple containing two DataFrames:
@@ -278,7 +252,6 @@ class ChainInterfaceDisplayer:
             metrics_df = self.metrics_df.copy()
 
         if len(metrics_df) == 0:
-            logging.warning("No data found for the given metrics_df.")
             return pd.DataFrame(), pd.DataFrame()
 
         if "cluster_id" not in metrics_df.columns:
@@ -307,7 +280,7 @@ class ChainInterfaceDisplayer:
             "lddt", level=["complex", "interface"]
         )
         for eval_type in all_eval_types.keys():
-            eval_df = self.select_df_by_eval_types(metrics_df, [eval_type])
+            eval_df = select_df_by_eval_types(metrics_df, [eval_type])
 
             # Drop NaN rows in lddt column
             eval_df.dropna(subset=["lddt"], inplace=True, how="all", axis=0)
@@ -342,8 +315,10 @@ class ChainInterfaceDisplayer:
 
                     if eval_type_level == "chain":
                         chain_id_2 = ""
+                        entity_id_2 = ""
                     else:
                         chain_id_2 = group_id[2]
+                        entity_id_2 = sample_lddt_row["entity_id_2"]
 
                     lddt_details.append(
                         {
@@ -353,7 +328,7 @@ class ChainInterfaceDisplayer:
                             "eval_type": eval_type,
                             "entry_id": group_id[0],
                             "entity_id_1": sample_lddt_row["entity_id_1"],
-                            "entity_id_2": sample_lddt_row["entity_id_2"],
+                            "entity_id_2": entity_id_2,
                             "chain_id_1": group_id[1],
                             "chain_id_2": chain_id_2,
                             "cluster_id": cluster_id,
@@ -381,6 +356,8 @@ class ChainInterfaceDisplayer:
 
         lddt_results_df = pd.DataFrame(lddt_results)
         lddt_details_df = pd.DataFrame(lddt_details)
+        lddt_results_df["subset"] = subset_name
+        lddt_details_df["subset"] = subset_name
         return lddt_results_df, lddt_details_df
 
 
@@ -418,17 +395,24 @@ class RMSDDisplayer:
         match_keys = ["entry_id", "seed", "sample", "chain_id_1", "type"]
 
         merged_metrics_df = pd.merge(
-            metrics_df,
+            metrics_df.reset_index(),
             pb_valid_df[match_keys + PB_VALID_CHECK_COL],
             how="left",
             on=match_keys,
-        )
+        ).set_index("index")
+        merged_metrics_df.index.name = metrics_df.index.name
 
         # Add penalty column as denominator: 0 or 100
         merged_metrics_df["penalty"] = merged_metrics_df.apply(
             lambda row: (
-                not row["minimum_distance_to_protein"]
-                or not row["tetrahedral_chirality"]
+                (
+                    not pd.isna(row["minimum_distance_to_protein"])
+                    and not row["minimum_distance_to_protein"]
+                )
+                or (
+                    not pd.isna(row["tetrahedral_chirality"])
+                    and not row["tetrahedral_chirality"]
+                )
             )
             * 100,
             axis=1,
@@ -441,17 +425,13 @@ class RMSDDisplayer:
     ) -> dict[str, callable]:
         # Initialize with basic aggregation functions
         agg_funcs = {
-            "best": lambda grp: grp.sort_values(
-                by="lig_rmsd_wo_refl", ascending=True
-            ).iloc[0],
-            "worst": lambda grp: grp.sort_values(
-                by="lig_rmsd_wo_refl", ascending=False
-            ).iloc[0],
+            "best": lambda grp: grp.sort_values(by="lig_rmsd", ascending=True).iloc[0],
+            "worst": lambda grp: grp.sort_values(by="lig_rmsd", ascending=False).iloc[
+                0
+            ],
             "rand": lambda grp: grp.sample(n=1).iloc[0],
             "median": lambda grp: grp.loc[
-                (grp["lig_rmsd_wo_refl"] - grp["lig_rmsd_wo_refl"].median())
-                .abs()
-                .idxmin()
+                (grp["lig_rmsd"] - grp["lig_rmsd"].median()).abs().idxmin()
             ],
         }
 
@@ -483,29 +463,62 @@ class RMSDDisplayer:
 
         return agg_funcs
 
-    def get_rmsd(self, success_threshold=2.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def get_rmsd(
+        self,
+        success_threshold=2.0,
+        mask_on_metrics_df: Sequence[bool] | None = None,
+        subset_name: str = "All",
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
         Calculate RMSD metrics for ligand and pocket chains.
 
         Args:
             success_threshold (float): The threshold for considering an RMSD value as a success.
-                              Defaults to 2.0.
+                            Defaults to 2.0.
+            mask_on_metrics_df (Sequence[bool] | None): A mask to filter the metrics DataFrame. Defaults to None.
 
         Returns:
             tuple[pd.DataFrame, pd.DataFrame]: A tuple containing two DataFrames:
                 - rmsd_results_df: A DataFrame containing the calculated RMSD metrics.
                 - rmsd_details_df: A DataFrame containing the details of each sample, including the seed, sample,
-                                   ranker, eval type, entry ID, chain ID, cluster ID, and RMSD values.
+                                ranker, eval type, entry ID, chain ID, cluster ID, and RMSD values.
         """
-        # rmsd label on chain level (ligand chain)
-        rmsd_df = self.metrics_df[self.metrics_df["type"] == "chain"].copy()
+        if mask_on_metrics_df is not None:
+            metrics_df = self.metrics_df[mask_on_metrics_df].copy()
+        else:
+            metrics_df = self.metrics_df.copy()
+
+        rmsd_df = metrics_df[metrics_df["type"] == "chain"].copy()
 
         if self.seeds:
-            # Selected by seeds
             rmsd_df = rmsd_df[rmsd_df["seed"].astype(str).isin(self.seeds)].copy()
 
-        # Drop NaN rows in lig_rmsd_wo_refl column
-        rmsd_df.dropna(subset=["lig_rmsd_wo_refl"], inplace=True, how="all", axis=0)
+        # Rename columns for legacy compatibility
+        if (
+            "lig_rmsd_wo_refl" in rmsd_df.columns
+            and "pocket_rmsd_wo_refl" in rmsd_df.columns
+        ) and (
+            "lig_rmsd" not in rmsd_df.columns and "pocket_rmsd" not in rmsd_df.columns
+        ):
+            rmsd_df = rmsd_df.rename(
+                columns={
+                    "lig_rmsd_wo_refl": "lig_rmsd",
+                    "pocket_rmsd_wo_refl": "pocket_rmsd",
+                }
+            )
+
+        # Drop NaN rows in lig_rmsd column
+        rmsd_df.dropna(subset=["lig_rmsd"], inplace=True, how="all", axis=0)
+
+        if "cluster_id" in rmsd_df.columns:
+            # Drop NaN rows in cluster_id column (ligand not in low homology subset)
+            rmsd_df.dropna(subset=["cluster_id"], inplace=True, how="all", axis=0)
+        else:
+            rmsd_df["cluster_id"] = (
+                rmsd_df["entry_id"].astype(str)
+                + "_"
+                + rmsd_df["chain_id_1"].astype(str)
+            )
 
         entry_id_num = len(rmsd_df["entry_id"].unique())
 
@@ -516,12 +529,23 @@ class RMSDDisplayer:
         rmsd_agg_funcs = self._get_rmsd_agg_funcs()
         for agg_func_name, agg_func in rmsd_agg_funcs.items():
             all_lig_rmsd = []
-            all_pocket_rmsd = []
-            all_pb_valid = defaultdict(list)
-            for group_id, group_df in rmsd_df.groupby(by=["entry_id", "chain_id_1"]):
+
+            # cluster_pb_all_valid_flags[cluster_id] -> list[int]
+            cluster_pb_all_valid_flags = defaultdict(list)
+            cluster_pb_all_valid_and_good_rmsd_flags = defaultdict(list)
+
+            # all_pb_valid[check_col][cluster_id] -> list[int]
+            all_pb_valid = defaultdict(lambda: defaultdict(list))
+
+            cluster_id_to_rmsd_scores = defaultdict(list)
+
+            for group_id, group_df in rmsd_df.groupby(
+                by=["entry_id", "chain_id_1"], observed=True
+            ):
                 sample_row = agg_func(group_df)
-                sample_lig_rmsd = sample_row["lig_rmsd_wo_refl"]
-                sample_pocket_rmsd = sample_row["pocket_rmsd_wo_refl"]
+                sample_lig_rmsd = sample_row["lig_rmsd"]
+                sample_pocket_rmsd = sample_row["pocket_rmsd"]
+                cluster_id = sample_row["cluster_id"]
 
                 rmsd_detail = {
                     "seed": sample_row["seed"],
@@ -533,51 +557,103 @@ class RMSDDisplayer:
                     "entity_id_2": "",
                     "chain_id_1": group_id[1],
                     "chain_id_2": "",
-                    "cluster_id": "",
-                    "lig_rmsd_wo_refl": sample_lig_rmsd,
-                    "pocket_rmsd_wo_refl": sample_pocket_rmsd,
+                    "cluster_id": cluster_id,
+                    "lig_rmsd": sample_lig_rmsd,
+                    "pocket_rmsd": sample_pocket_rmsd,
                 }
 
+                sample_pb_flags = []
                 for check_col in existed_pb_check_rows:
                     check_result = sample_row[check_col]
-                    rmsd_detail[check_col] = check_result
-                    all_pb_valid[check_col].append(int(sample_row[check_col]))
+                    # if NaN, it will be True -> 1
+                    check_flag = 1 if pd.isna(check_result) or bool(check_result) else 0
+                    rmsd_detail[check_col] = check_flag
+                    all_pb_valid[check_col][cluster_id].append(check_flag)
+                    sample_pb_flags.append(check_flag)
+
+                if existed_pb_check_rows:
+                    all_valid_flag = int(all(sample_pb_flags))
+                    cluster_pb_all_valid_flags[cluster_id].append(all_valid_flag)
+
+                    good_rmsd_flag = int(
+                        (sample_lig_rmsd is not None)
+                        and (sample_lig_rmsd < success_threshold)
+                        and bool(all_valid_flag)
+                    )
+                    cluster_pb_all_valid_and_good_rmsd_flags[cluster_id].append(
+                        good_rmsd_flag
+                    )
 
                 rmsd_details.append(rmsd_detail)
                 all_lig_rmsd.append(sample_lig_rmsd)
-                all_pocket_rmsd.append(sample_pocket_rmsd)
+                cluster_id_to_rmsd_scores[cluster_id].append(sample_lig_rmsd)
 
-            all_lig_rmsd = np.array(all_lig_rmsd)
-            lig_sr = np.mean(all_lig_rmsd < success_threshold)
-            lig_avg_rmsd = np.mean(all_lig_rmsd)
+            if len(all_lig_rmsd) == 0:
+                continue
 
-            all_pocket_rmsd = np.array(all_pocket_rmsd)
-            pocket_sr = np.mean(all_pocket_rmsd < success_threshold)
-            pocket_avg_rmsd = np.mean(all_pocket_rmsd)
+            all_avg_lig_rmsd = []
+            all_avg_lig_rmsd_sr = []
+            for cluster_id, rmsd_scores in cluster_id_to_rmsd_scores.items():
+                rmsd_arr = np.asarray(rmsd_scores, dtype=float)
+                avg_lig_rmsd = float(np.mean(rmsd_arr))
+                avg_lig_rmsd_sr = float(np.mean(rmsd_arr < success_threshold))
+                all_avg_lig_rmsd.append(avg_lig_rmsd)
+                all_avg_lig_rmsd_sr.append(avg_lig_rmsd_sr)
+
+            avg_lig_rmsd = float(np.mean(all_avg_lig_rmsd))
+            avg_lig_rmsd_sr_avg_sr = float(np.mean(all_avg_lig_rmsd_sr))
+
+            all_lig_rmsd_arr = np.asarray(all_lig_rmsd, dtype=float)
+            if len(all_lig_rmsd) == len(cluster_id_to_rmsd_scores):
+                # N_cluster == N_sample
+                lig_sr_ci = get_binomial_ci(
+                    total_num=len(all_lig_rmsd),
+                    success_num=int((all_lig_rmsd_arr < success_threshold).sum()),
+                )
+            else:
+                lig_sr_ci = get_bootstrap_ci(all_avg_lig_rmsd_sr)
 
             rmsd_result = {
                 "entry_id_num": entry_id_num,
+                "cluster_num": len(cluster_id_to_rmsd_scores),
                 "ranker": agg_func_name,
-                "lig_avg_rmsd": lig_avg_rmsd,
-                "lig_rmsd_sr": lig_sr,
-                "pocket_avg_rmsd": pocket_avg_rmsd,
-                "pocket_rmsd_sr": pocket_sr,
-                "ci_lig_avg_rmsd": get_bootstrap_ci(all_lig_rmsd),
-                "ci_lig_rmsd_sr": get_binomial_ci(
-                    total_num=len(all_lig_rmsd),
-                    success_num=(all_lig_rmsd < success_threshold).sum(),
-                ),
-                "ci_pocket_avg_rmsd": get_bootstrap_ci(all_pocket_rmsd),
-                "ci_pocket_rmsd_sr": get_binomial_ci(
-                    total_num=len(all_pocket_rmsd),
-                    success_num=(all_pocket_rmsd < success_threshold).sum(),
-                ),
+                "lig_avg_rmsd": avg_lig_rmsd,
+                "lig_rmsd_sr": avg_lig_rmsd_sr_avg_sr,
+                "ci_lig_avg_rmsd": get_bootstrap_ci(all_avg_lig_rmsd),
+                "ci_lig_rmsd_sr": lig_sr_ci,
             }
 
             for check_col in existed_pb_check_rows:
-                rmsd_result[check_col] = np.mean(all_pb_valid[check_col])
+                cluster_means = []
+                for cluster_results in all_pb_valid[check_col].values():
+                    cluster_means.append(float(np.mean(cluster_results)))
+                rmsd_result[check_col] = (
+                    float(np.mean(cluster_means)) if cluster_means else np.nan
+                )
+
+            if existed_pb_check_rows:
+                cluster_all_valid_means = []
+                for flags in cluster_pb_all_valid_flags.values():
+                    cluster_all_valid_means.append(float(np.mean(flags)))
+                rmsd_result["pb_all_valid_sr"] = (
+                    float(np.mean(cluster_all_valid_means))
+                    if cluster_all_valid_means
+                    else np.nan
+                )
+
+                cluster_all_valid_and_good_rmsd_means = []
+                for flags in cluster_pb_all_valid_and_good_rmsd_flags.values():
+                    cluster_all_valid_and_good_rmsd_means.append(float(np.mean(flags)))
+                rmsd_result["pb_all_valid_and_good_rmsd_sr"] = (
+                    float(np.mean(cluster_all_valid_and_good_rmsd_means))
+                    if cluster_all_valid_and_good_rmsd_means
+                    else np.nan
+                )
 
             rmsd_results.append(rmsd_result)
+
         rmsd_results_df = pd.DataFrame(rmsd_results)
         rmsd_details_df = pd.DataFrame(rmsd_details)
+        rmsd_results_df["subset"] = subset_name
+        rmsd_details_df["subset"] = subset_name
         return rmsd_results_df, rmsd_details_df

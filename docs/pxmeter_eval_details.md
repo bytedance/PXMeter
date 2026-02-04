@@ -45,7 +45,9 @@ these stages:
 6. **Package all results** into a structured object (`MetricResult`) which can
    be converted to JSON.
 
-By default, all mapping steps are enabled and all metrics above are computed.
+By default, all mapping steps are enabled. Most metrics are computed, but
+ligand‑specific metrics (pocket RMSD, PoseBusters) are only computed when
+`interested_lig_label_asym_id` is provided.
 
 ---
 
@@ -68,7 +70,9 @@ At runtime the user typically calls `evaluate()` with:
   (pocket RMSD, PoseBusters) are *skipped*.
 - `run_config` (default `RUN_CONFIG`): global configuration object. By default:
   - entity and ligand mapping are enabled,
-  - all metrics (clashes, LDDT, DockQ, RMSD, PoseBusters) are enabled,
+  - metric switches are enabled (clashes, LDDT, DockQ, RMSD, PoseBusters),
+    but RMSD and PoseBusters are only executed when `interested_lig_label_asym_id`
+    is provided,
   - LDDT uses a nucleotide radius of 30 Å and a non‑nucleotide radius of 15 Å,
   - clash detection uses half the sum of van der Waals radii as the clash
     threshold.
@@ -156,9 +160,8 @@ applying the following rules:
 2. **Hydrogen removal (enabled by default)**
    - Atoms whose element is H or D are removed.
 
-3. **Unknown element X removal (enabled by default)**
-   - Entire residues labelled UNX or UNL are examined;
-   - atoms whose element is X in such residues are removed.
+3. **Unknown / placeholder residues removal (enabled by default)**
+   - Entire residues labelled UNX or UNL are removed.
 
 4. **Crystallisation additive removal (enabled by default)**
    - If the experimental methods indicate a crystallographic technique
@@ -169,8 +172,7 @@ applying the following rules:
        accidentally deleting protein chains).
 
 At the end of this step, a new structure is created containing only atoms that
-survived the mask; the “unique chain ID” and “unique atom ID” arrays are
-recomputed accordingly.
+survived the mask.
 
 The net effect is that both reference and model structures are reduced to
 clean, comparable coordinate sets without water, hydrogens, stray X atoms or
@@ -228,8 +230,10 @@ Ligand mapping is done in two passes:
    - For each model/reference ligand pair, a Morgan fingerprint is computed
      (radius = 2, size = 2048, with chirality), and Tanimoto similarity is
      measured.
-   - Pairs are sorted by similarity and greedily assigned until there are no
-     high‑similarity pairs left.
+   - Pairs are sorted by similarity and tried greedily.
+   - Note: the current implementation does not enforce an explicit similarity
+     threshold; whether a pair is accepted also depends on whether a consistent
+     atom‑level graph match can be found.
 
 By default, ligand mapping is **enabled**.
 
@@ -656,11 +660,13 @@ complementing the all‑atom LDDT that also reflects side‑chain quality.
 
 When `metric.lddt.calc_backbone_lddt` is enabled, PXMeter first builds a backbone atom mask on the reference structure (for example, representative main‑chain atoms in each polymer residue) and computes LDDT using only distances between these backbone atoms.
 
-If `metric.lddt.stereochecks` is also set to `True`, only backbone atoms that pass stereochemical validation are allowed to contribute to backbone‑only LDDT; residues whose backbone atoms fail the checks are effectively excluded. Chains or interfaces with no valid backbone atom pairs simply do not get a backbone‑only LDDT value in the results.
+If `metric.lddt.stereochecks` is also set to `True`, backbone‑only LDDT still evaluates over backbone atom pairs, but pairs touching stereochemically invalid backbone atoms contribute zero (they are not dropped from the averaging). If a chain/interface has no backbone atom pairs at all (e.g. too few atoms after filtering), the backbone‑only LDDT entry may be omitted from results.
 
 ### 8.4 DockQ (interface quality)
 
-DockQ provides an alternative, interface‑centric quality measure. PXMeter uses a native implementation that follows the official DockQ metric definitions.
+DockQ provides an alternative, interface‑centric quality measure. PXMeter uses a native implementation that follows the official DockQ *formulae*.
+
+Note: residue pairing differs from the official DockQ pipeline. In PXMeter, residues are paired by `(res_id, res_name)` after the upstream mapping/permutation steps, rather than by an explicit sequence alignment.
 
 Runtime behaviour (default):
 

@@ -25,6 +25,7 @@ from pxmeter.eval import evaluate, MetricResult
 from pxmeter.input_builder.constants import VALID_INPUT_TYPES, VALID_OUTPUT_TYPES
 from pxmeter.input_builder.gen_input import run_gen_input
 from pxmeter.input_builder.interactive import run_interactive_gen
+from pxmeter.metrics.stereochemistry.check import stereochem_check_to_csv
 from pxmeter.utils import read_chain_id_to_mol_from_json, str_to_none
 
 logging.basicConfig(
@@ -189,6 +190,42 @@ def cli(
         )
 
 
+@cli.command(name="stereocheck")
+@click.option(
+    "-c",
+    "--cif",
+    "cif",
+    type=click.Path(path_type=Path, exists=True),
+    required=True,
+    help="Path to the model CIF file.",
+)
+@click.option(
+    "-o",
+    "--output-csv",
+    "output_csv",
+    type=click.Path(path_type=Path),
+    default=Path("./stereochem_report.csv"),
+    show_default=True,
+    help="Path to the output CSV report.",
+)
+def stereochem_cli(
+    cif: Path,
+    output_csv: Path,
+):
+    """
+    Run stereochemistry checks for a single model CIF and export a CSV report.
+    """
+
+    report_df = stereochem_check_to_csv(
+        model_cif=cif,
+        output_csv=output_csv,
+    )
+    if report_df is None:
+        logging.info("No stereochemistry violations found.")
+    else:
+        logging.info("Output stereochemistry report to %s", output_csv)
+
+
 @cli.group(name="ccd")
 def ccd_cli():
     """
@@ -245,7 +282,6 @@ def update():
 @click.option(
     "-p",
     "--pdb-ids",
-    "pdb_ids",
     type=str,
     default=None,
     help=(
@@ -272,7 +308,6 @@ def update():
 @click.option(
     "-a",
     "--assembly-id",
-    "assembly_id",
     type=str,
     default=None,
     help="Assembly ID in the input CIF file. Defaults to None. Ignored for non-CIF input types.",

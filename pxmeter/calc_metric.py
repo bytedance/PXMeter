@@ -30,7 +30,6 @@ from pxmeter.configs.run_config import RUN_CONFIG
 from pxmeter.constants import IONS, LIGAND
 from pxmeter.data.ccd import get_ccd_mol_from_chain_atom_array
 from pxmeter.data.struct import Structure
-from pxmeter.metrics.clashes import check_clashes_by_vdw
 from pxmeter.metrics.dockq import compute_dockq
 from pxmeter.metrics.lddt_metrics import LDDT
 from pxmeter.metrics.rmsd_metrics import RMSDMetrics
@@ -449,6 +448,120 @@ class MetricResult:
             else:
                 tar_dict[key] = value
 
+    @staticmethod
+    def _calc_stereochecks_summary(
+        atom_mask: np.ndarray,
+        clash_df: pd.DataFrame,
+        bad_bond_df: pd.DataFrame,
+        bad_angle_df: pd.DataFrame,
+    ) -> dict[str, int]:
+        """
+        ggregate stereochemistry violations within an atom subset.
+
+        - `clash_atoms`: number of unique atoms involved in clashes (within subset)
+        - `bad_bonds`: number of bad bonds (within subset)
+        - `bad_angles`: number of bad angles (within subset)
+
+        The `idx*` columns in DataFrames are indices into the mapped atom arrays.
+        """
+
+        atom_mask = np.asarray(atom_mask, dtype=bool)
+
+        clash_atoms = 0
+        if clash_df is not None and (not clash_df.empty):
+            idx1 = clash_df["idx1"].to_numpy(dtype=np.int64, copy=False)
+            idx2 = clash_df["idx2"].to_numpy(dtype=np.int64, copy=False)
+            row_mask = atom_mask[idx1] & atom_mask[idx2]
+            if np.any(row_mask):
+                clash_atoms = int(
+                    np.unique(np.concatenate([idx1[row_mask], idx2[row_mask]])).size
+                )
+
+        bond_cnt = 0
+        if bad_bond_df is not None and (not bad_bond_df.empty):
+            idx1 = bad_bond_df["idx1"].to_numpy(dtype=np.int64, copy=False)
+            idx2 = bad_bond_df["idx2"].to_numpy(dtype=np.int64, copy=False)
+            bond_cnt = int(np.sum(atom_mask[idx1] & atom_mask[idx2]))
+
+        angle_cnt = 0
+        if bad_angle_df is not None and (not bad_angle_df.empty):
+            idx_a = bad_angle_df["idx_a"].to_numpy(dtype=np.int64, copy=False)
+            idx_b = bad_angle_df["idx_b"].to_numpy(dtype=np.int64, copy=False)
+            idx_c = bad_angle_df["idx_c"].to_numpy(dtype=np.int64, copy=False)
+            angle_cnt = int(
+                np.sum(atom_mask[idx_a] & atom_mask[idx_b] & atom_mask[idx_c])
+            )
+
+        return {
+            "clash_atoms": clash_atoms,
+            "bad_bonds": bond_cnt,
+            "bad_angles": angle_cnt,
+        }
+
+    @classmethod
+    def _maybe_add_lddt_stereochecks_summaries(
+        cls,
+        *,
+        lddt_config: ConfigDict,
+        lddt_calculator: LDDT,
+        ref_struct: Structure,
+        chains: list[str],
+        interfaces: list[tuple[str, str]],
+        complex_result_dict: dict[str, Any],
+        chain_result_dict: dict[str, dict[str, Any]],
+        interface_result_dict: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        """Attach stereochemistry violation summaries to output dicts.
+
+        Only active when `metric.lddt.stereochecks=True` and the underlying
+        stereochemistry checker produced violation tables.
+        """
+
+        if not lddt_config.stereochecks:
+            return
+
+        stereo_violation_dfs = getattr(lddt_calculator, "stereo_violation_dfs", None)
+        if stereo_violation_dfs is None:
+            return
+
+        clash_df, bad_bond_df, bad_angle_df = stereo_violation_dfs
+        n_atoms = len(ref_struct.atom_array)
+
+        # Complex-level summary
+        complex_result_dict["stereochecks"] = cls._calc_stereochecks_summary(
+            atom_mask=np.ones(n_atoms, dtype=bool),
+            clash_df=clash_df,
+            bad_bond_df=bad_bond_df,
+            bad_angle_df=bad_angle_df,
+        )
+
+        # Chain-level summary (keyed by reference chain IDs)
+        for chain_id in chains:
+            chain_atom_mask = ref_struct.uni_chain_id == chain_id
+            chain_result_dict.setdefault(chain_id, {})[
+                "stereochecks"
+            ] = cls._calc_stereochecks_summary(
+                atom_mask=chain_atom_mask,
+                clash_df=clash_df,
+                bad_bond_df=bad_bond_df,
+                bad_angle_df=bad_angle_df,
+            )
+
+        # Interface-level summary (keyed by sorted(reference chain IDs))
+        for chain_1, chain_2 in interfaces:
+            interface_key = tuple(sorted((chain_1, chain_2)))
+            interface_atom_mask = (ref_struct.uni_chain_id == chain_1) | (
+                ref_struct.uni_chain_id == chain_2
+            )
+            interface_result_dict.setdefault(interface_key, {})[
+                "stereochecks"
+            ] = cls._calc_stereochecks_summary(
+                atom_mask=interface_atom_mask,
+                clash_df=clash_df,
+                bad_bond_df=bad_bond_df,
+                bad_angle_df=bad_angle_df,
+            )
+
     @classmethod
     def from_struct(
         cls,
@@ -502,16 +615,6 @@ class MetricResult:
         meta_info_dict["ref_to_model_chain_mapping"] = chain_map
         meta_info_dict["ref_chain_info"] = cls._get_chain_info(ref_struct)
 
-        # Calculate clashes
-        if metric_config.calc_clashes:
-            clashes = check_clashes_by_vdw(
-                model_struct.atom_array,
-                vdw_scale_factor=metric_config.clashes.vdw_scale_factor,
-            )
-            complex_result_dict["clashes"] = len(
-                {x for a, b in clashes for x in (a, b)}
-            )
-
         # Calculate RMSD (if ligand and pocket specified in ref_features)
         if metric_config.calc_rmsd and interested_lig_label_asym_id:
             rmsd_metrics = RMSDMetrics(
@@ -537,6 +640,18 @@ class MetricResult:
                 model_struct=model_struct,
                 lddt_config=metric_config.lddt,
             )
+
+            cls._maybe_add_lddt_stereochecks_summaries(
+                lddt_config=metric_config.lddt,
+                lddt_calculator=calc_lddt.lddt_calculator,
+                ref_struct=ref_struct,
+                chains=chains,
+                interfaces=interfaces,
+                complex_result_dict=complex_result_dict,
+                chain_result_dict=chain_result_dict,
+                interface_result_dict=interface_result_dict,
+            )
+
             complex_lddt = calc_lddt.get_complex_lddt()
             if not np.isnan(complex_lddt):
                 complex_result_dict["lddt"] = complex_lddt

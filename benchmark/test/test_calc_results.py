@@ -19,13 +19,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-from benchmark.configs.data_config import SUPPORTED_DATA
-from benchmark.show_intersection_results import (
-    get_low_homology_subset,
-    get_recent_pdb_results_df,
-)
 from pxmeter.constants import PROTEIN
+
+from benchmark.show_intersection_results import get_low_homology_subset
+from benchmark.show_results import ChainInterfaceDisplayer
 
 TEST_DATA_DIR = Path(__file__).absolute().parent / "files"
 
@@ -63,7 +60,15 @@ class TestCalcResults(unittest.TestCase):
             },
             low_memory=False,
         )
-        lowh_df = get_low_homology_subset(df, SUPPORTED_DATA.recentpdb_low_homology)
+
+        # Construct a "low homology table" using the current metrics file itself,
+        # keeping only the `type/entry_id/entity_id_1/entity_id_2` fields,
+        # then reuse the matching logic of `get_low_homology_subset` to generate the subset.
+        # This way, the test does not depend on the external complete RecentPDB data file,
+        # maintaining portability.
+        lowh_meta_df = df[["type", "entry_id", "entity_id_1", "entity_id_2"]].copy()
+        lowh_mask = get_low_homology_subset(df, lowh_meta_df)
+        lowh_df = df[lowh_mask].copy()
 
         prot_prot_df = lowh_df[
             (lowh_df["type"] == "interface")
@@ -99,8 +104,13 @@ class TestCalcResults(unittest.TestCase):
         final_mean_best_score = np.mean(list(cluster_id_to_mean_best.values()))
         final_mean_median_score = np.mean(list(cluster_id_to_mean_median.values()))
 
-        dockq_results_df, _lddt_results_df, _dockq_details_df, _lddt_details_df = (
-            get_recent_pdb_results_df(df)
+        # Use the same aggregation logic as the production code (ChainInterfaceDisplayer)
+        # to calculate DockQ statistics for Protein-Protein interfaces and compare with
+        # the manual implementation.
+        displayer = ChainInterfaceDisplayer(lowh_df, model="nan", seeds=None)
+        dockq_results_df, _dockq_details_df = displayer.get_dockq_sr_by_cluster(
+            eval_types=["Protein-Protein"],
+            subset_name="All",
         )
 
         self.assertAlmostEqual(

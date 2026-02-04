@@ -23,7 +23,7 @@ from biotite.structure.info import residue
 from biotite.structure.io.pdbx.convert import PDBX_BOND_TYPE_ID_TO_TYPE
 from rdkit import Chem
 
-from pxmeter.constants import LIGAND, POLYMER, STD_RESIDUES
+from pxmeter.constants import LIGAND, POLYMER, PROTEIN_D, STD_RESIDUES
 from pxmeter.data.struct import Structure
 
 
@@ -466,7 +466,9 @@ class Sequences:
             bond_mask = bond_array[:, 2] != biotite_metalc_type
             bond_array = bond_array[bond_mask]
 
-        is_polymer = structure.get_mask_for_given_entity_types(entity_types=POLYMER)
+        is_polymer = structure.get_mask_for_given_entity_types(
+            entity_types=POLYMER + [PROTEIN_D]
+        )
         chain_id = structure.uni_chain_id
         res_id = structure.atom_array.res_id
         atoms1 = bond_array[:, 0]
@@ -553,7 +555,7 @@ class Sequences:
         # Only support protein, dna, rna
         non_std_polymer_entities = []
         for entity_id, entity_type in structure.entity_poly_type.items():
-            if entity_type not in POLYMER:
+            if entity_type not in (POLYMER + [PROTEIN_D]):
                 non_std_polymer_entities.append(entity_id)
         non_std_polymer_entity_mask = ~np.isin(
             structure.atom_array.label_entity_id, non_std_polymer_entities

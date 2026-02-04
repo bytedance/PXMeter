@@ -18,7 +18,7 @@ from typing import Union
 import numpy as np
 from scipy.spatial import KDTree
 
-from pxmeter.constants import PROTEIN
+from pxmeter.constants import POLYMER
 from pxmeter.data.struct import Structure
 from pxmeter.metrics.rmsd import partially_aligned_rmsd
 
@@ -50,8 +50,15 @@ class RMSDMetrics:
         lig_label_asym_id: Union[str, list[str]],
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Find the ligand and its corresponding pocket by ligand label asym_id.
-        Pocket is the protein chain with the most atoms within 10 Å of the ligand,
+        Identify ligand atoms and their nearby receptor backbone (“pocket”) atoms by ligand label_asym_id.
+
+        Given one or more ligand chain identifiers (label_asym_id), this function:
+            1) Builds a KD-tree on all atom coordinates.
+            2) For each ligand, finds all atoms within 10 Å of any ligand atom.
+            3) Among polymer chains, selects the “primary” receptor chain as the one with the
+                most backbone atoms (protein CA / nucleic-acid C1′) in that 10 Å neighborhood.
+            4) Returns two boolean masks per ligand: the ligand-atom mask and the pocket mask
+                (backbone atoms from the selected primary chain within 10 Å).
 
         Args:
             struct (Structure): The structure containing the AtomArray.
@@ -61,10 +68,7 @@ class RMSDMetrics:
             tuple[np.ndarray, np.ndarray]: A tuple of ligand pocket mask
                                            and pocket mask (dtype=bool).
         """
-        protein_entities = [
-            k for k, v in struct.entity_poly_type.items() if v == PROTEIN
-        ]
-        is_protein = np.isin(struct.atom_array.label_entity_id, protein_entities)
+        is_polymer = struct.get_mask_for_given_entity_types(POLYMER)
 
         if isinstance(lig_label_asym_id, str):
             lig_label_asym_ids = [lig_label_asym_id]
@@ -72,8 +76,8 @@ class RMSDMetrics:
             lig_label_asym_ids = list(lig_label_asym_id)
 
         # Get backbone mask
-        prot_backbone = (
-            is_protein & np.isin(struct.atom_array.atom_name, ["C", "N", "CA"])
+        polymer_backbone = (
+            is_polymer & np.isin(struct.atom_array.atom_name, ["CA", "C1'"])
         ).astype(bool)
 
         kdtree = KDTree(struct.atom_array.coord)
@@ -97,8 +101,8 @@ class RMSDMetrics:
                 for i in range(len(struct.atom_array))
             ]
 
-            # Get primary chain (protein backone in 10 Angstrom radius)
-            primary_chain_candidates = near_atoms & prot_backbone
+            # Get primary chain (polymer backone in 10 Angstrom radius)
+            primary_chain_candidates = near_atoms & polymer_backbone
             primary_chain_candidates_uni_chain_id = struct.uni_chain_id[
                 primary_chain_candidates
             ]
@@ -118,8 +122,17 @@ class RMSDMetrics:
                 struct.uni_chain_id == primary_chain_id
             )
 
-            assert np.sum(ligand_mask) >= 1, "No ligand found."
-            assert np.sum(pocket_mask) >= 1, "No pocket found."
+            num_pocket_atoms = np.sum(pocket_mask)
+            num_ligand_atoms = np.sum(ligand_mask)
+            assert (
+                num_ligand_atoms >= 1
+            ), f"No ligand atoms found. (lig chain: {lig_label_asym_id})"
+            assert num_pocket_atoms >= 3, (
+                "Pocket not found or less than 3 backbone atoms "
+                f"(lig chain: {lig_label_asym_id}, found {num_pocket_atoms} "
+                f"backbone atoms of pocket chain {primary_chain_id})."
+            )
+
             ligand_mask_list.append(ligand_mask)
             pocket_mask_list.append(pocket_mask)
 
@@ -136,10 +149,8 @@ class RMSDMetrics:
                 - Key: Reference ligand chain ID
                 - Value: Dictionary with:
                     * 'ref_pocket_chain': Corresponding pocket chain ID
-                    * 'lig_rmsd_w_refl': Ligand RMSD with reflection allowed
-                    * 'pocket_rmsd_w_refl': Pocket RMSD with reflection allowed
-                    * 'lig_rmsd_wo_refl': Ligand RMSD without reflection
-                    * 'pocket_rmsd_wo_refl': Pocket RMSD without reflection
+                    * 'lig_rmsd': Ligand RMSD without reflection
+                    * 'pocket_rmsd': Pocket RMSD without reflection
                     (All RMSD values in Angstroms)
         """
         (
@@ -156,15 +167,7 @@ class RMSDMetrics:
         ):
             ref_lig_chain_id = self.ref_struct.uni_chain_id[ligand_mask][0]
             ref_pocket_chain_id = self.ref_struct.uni_chain_id[pocket_mask][0]
-            pocket_rmsd_w_refl, lig_rmsd_w_refl, _, _ = partially_aligned_rmsd(
-                self.model_struct.atom_array.coord,
-                self.ref_struct.atom_array.coord,
-                align_mask=pocket_mask,
-                rmsd_mask=ligand_mask,
-                reduce=True,
-                allow_reflection=True,
-            )
-            pocket_rmsd_wo_refl, lig_rmsd_wo_refl, _, _ = partially_aligned_rmsd(
+            pocket_rmsd, lig_rmsd, _, _ = partially_aligned_rmsd(
                 self.model_struct.atom_array.coord,
                 self.ref_struct.atom_array.coord,
                 align_mask=pocket_mask,
@@ -174,9 +177,7 @@ class RMSDMetrics:
             )
             rmsd_result_dict[ref_lig_chain_id] = {
                 "ref_pocket_chain": ref_pocket_chain_id,
-                "lig_rmsd_w_refl": lig_rmsd_w_refl,
-                "pocket_rmsd_w_refl": pocket_rmsd_w_refl,
-                "lig_rmsd_wo_refl": lig_rmsd_wo_refl,
-                "pocket_rmsd_wo_refl": pocket_rmsd_wo_refl,
+                "lig_rmsd": lig_rmsd,
+                "pocket_rmsd": pocket_rmsd,
             }
         return rmsd_result_dict

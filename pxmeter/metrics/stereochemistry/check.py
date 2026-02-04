@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+from biotite.structure.bonds import BondType
 from biotite.structure.info.radii import vdw_radius_single
 from scipy.spatial import KDTree
 
@@ -70,12 +72,247 @@ class StereoChemValidator:
         self._res_name = self.atom_array.res_name
         self._atom_name = self.atom_array.atom_name
 
+        # Cache per-atom entity/polymer type to avoid repeated Python loops
+        label_entity_ids = self.atom_array.label_entity_id
+        self._entity_types = np.fromiter(
+            (self.entity_poly_type.get(eid, "OTHER") for eid in label_entity_ids),
+            dtype=object,
+            count=len(label_entity_ids),
+        )
+
         self.res_groups = self._preprocess_residue_groups()
+
+        # Some model mmCIFs omit key inter-residue covalent connectivity.
+        # - Peptide bonds (C-N) are often not present in `_struct_conn`.
+        # - Phosphodiester backbone bonds (O3'-P) are often not present in `_struct_conn`.
+        # - Disulfide links may be missing as well.
+        # We infer these so that covalently bonded pairs are excluded from
+        # clash checks and become eligible for inter-res bond validation.
+        self._infer_and_add_peptide_bonds(max_c_n_dist=1.8)
+        self._infer_and_add_na_backbone_bonds(max_p_o3_dist=2.1)
+        self._infer_and_add_disulfide_bonds(max_sg_sg_dist=2.2)
+
+        # Depends on bond graph (e.g. PRO cis/trans classification)
         self.inter_res_types = self._classify_inter_residue_types()
 
         # Precompute VDW radii and bond hashes for clash detection
         self._vdw_radii = self._calculate_vdw_radii()
         self._bond_hashes = self._calculate_bond_hashes()
+
+    def _infer_and_add_disulfide_bonds(self, *, max_sg_sg_dist: float = 2.2) -> None:
+        """
+        Infer missing CYS SG-SG bonds and add them to the bond graph.
+
+        This is a conservative heuristic for models that do not encode
+        disulfide connectivity.
+        """
+
+        atom_array = self.atom_array
+        if atom_array.bonds is None:
+            return
+
+        res_names = self._res_name
+        atom_names = self._atom_name
+        is_cys_sg = (res_names == "CYS") & (atom_names == "SG")
+        sg_idx = np.where(is_cys_sg)[0]
+        if sg_idx.size < 2:
+            return
+
+        coords_sg = atom_array.coord[sg_idx]
+        tree = KDTree(coords_sg)
+        pairs_local = tree.query_pairs(max_sg_sg_dist, output_type="ndarray")
+        if pairs_local.size == 0:
+            return
+
+        # Map local KDTree indices back to atom indices
+        i_global = sg_idx[pairs_local[:, 0]]
+        j_global = sg_idx[pairs_local[:, 1]]
+
+        # Exclude within the same residue
+        chain_ids = self._uni_chain_id
+        res_ids = self._res_id
+        diff_res = (chain_ids[i_global] != chain_ids[j_global]) | (
+            res_ids[i_global] != res_ids[j_global]
+        )
+        i_global = i_global[diff_res]
+        j_global = j_global[diff_res]
+        if i_global.size == 0:
+            return
+
+        dists = np.linalg.norm(
+            atom_array.coord[i_global] - atom_array.coord[j_global], axis=1
+        )
+        order = np.argsort(dists)
+        i_global = i_global[order]
+        j_global = j_global[order]
+
+        used = set()
+        bonds = atom_array.bonds
+        for i, j in zip(i_global.tolist(), j_global.tolist()):
+            if i in used or j in used:
+                continue
+
+            # Skip if already bonded
+            neigh, _ = bonds.get_bonds(i)
+            if j in neigh:
+                used.add(i)
+                used.add(j)
+                continue
+
+            bonds.add_bond(i, j, bond_type=BondType.SINGLE)
+            used.add(i)
+            used.add(j)
+
+    def _infer_and_add_peptide_bonds(self, *, max_c_n_dist: float = 1.8) -> None:
+        """
+        Infer missing peptide C-N bonds and add them to the bond graph.
+
+        Many predicted/model mmCIFs do not encode polymer backbone bonds in
+        `_struct_conn`, hence `biotite.structure.io.pdbx.get_structure()` will
+        not populate these inter-residue bonds.
+
+        We conservatively connect consecutive protein residues within the same
+        chain when their backbone C (prev residue) and N (next residue) are
+        within a distance threshold.
+        """
+
+        atom_array = self.atom_array
+        if atom_array.bonds is None:
+            return
+
+        atom_name = self._atom_name
+        chain_id = self._uni_chain_id
+        res_id = self._res_id
+
+        # Determine per-atom entity/polymer types
+        entity_types = self._entity_types
+
+        # Fast early-outs
+        if not np.any(entity_types == PROTEIN):
+            return
+
+        # Map residue key -> backbone atom index (use one atom per residue)
+        c_indices = np.where(atom_name == "C")[0]
+        n_indices = np.where(atom_name == "N")[0]
+        if c_indices.size == 0 or n_indices.size == 0:
+            return
+        c_map = {(chain_id[i], res_id[i]): i for i in c_indices}
+        n_map = {(chain_id[i], res_id[i]): i for i in n_indices}
+
+        # Residues are expected to be contiguous in AtomArray.
+        # Compute residue starts in O(N) without `np.unique(axis=0)` to avoid
+        # dtype upcasting and extra allocations.
+        n_atoms = len(chain_id)
+        if n_atoms < 2:
+            return
+        change = np.ones(n_atoms, dtype=bool)
+        change[1:] = (chain_id[1:] != chain_id[:-1]) | (res_id[1:] != res_id[:-1])
+        first_pos = np.where(change)[0]
+
+        # Build ordered residue keys and their entity types
+        res_keys = [(chain_id[i], res_id[i]) for i in first_pos.tolist()]
+        res_ent = entity_types[first_pos]
+
+        if res_ent.size < 2:
+            return
+
+        bonds = atom_array.bonds
+        coords = atom_array.coord
+
+        for k0, k1, t0, t1 in zip(
+            res_keys[:-1], res_keys[1:], res_ent[:-1], res_ent[1:]
+        ):
+            # Only connect within the same chain and protein polymer
+            if k0[0] != k1[0]:
+                continue
+            if not (t0 == PROTEIN and t1 == PROTEIN):
+                continue
+
+            c0 = c_map.get(k0)
+            n1 = n_map.get(k1)
+            if c0 is None or n1 is None:
+                continue
+
+            # Avoid linking across chain breaks / missing segments
+            if np.linalg.norm(coords[c0] - coords[n1]) > max_c_n_dist:
+                continue
+
+            neigh, _ = bonds.get_bonds(c0)
+            if n1 in neigh:
+                continue
+            bonds.add_bond(c0, n1, bond_type=BondType.SINGLE)
+
+    def _infer_and_add_na_backbone_bonds(self, *, max_p_o3_dist: float = 2.1) -> None:
+        """
+        Infer missing nucleic-acid backbone bonds (O3'-P) and add them.
+
+        Similar to peptide bonds, many predicted/model mmCIFs omit nucleic-acid
+        inter-residue bonds in `_struct_conn`, leading to O3'-P pairs being
+        treated as non-bonded contacts (and potentially flagged as clashes).
+
+        We conservatively connect consecutive nucleic-acid residues within the
+        same chain when their O3' (prev residue) and P (next residue) are within
+        a distance threshold.
+        """
+
+        atom_array = self.atom_array
+        if atom_array.bonds is None:
+            return
+
+        atom_name = self._atom_name
+        chain_id = self._uni_chain_id
+        res_id = self._res_id
+
+        entity_types = self._entity_types
+
+        # Fast early-outs
+        if not np.any((entity_types == DNA) | (entity_types == RNA)):
+            return
+
+        # Backbone atoms
+        p_indices = np.where(atom_name == "P")[0]
+        o3_mask = (atom_name == "O3'") | (atom_name == "O3*")
+        o3_indices = np.where(o3_mask)[0]
+        if p_indices.size == 0 or o3_indices.size == 0:
+            return
+
+        p_map = {(chain_id[i], res_id[i]): i for i in p_indices}
+        o3_map = {(chain_id[i], res_id[i]): i for i in o3_indices}
+
+        n_atoms = len(chain_id)
+        if n_atoms < 2:
+            return
+        change = np.ones(n_atoms, dtype=bool)
+        change[1:] = (chain_id[1:] != chain_id[:-1]) | (res_id[1:] != res_id[:-1])
+        first_pos = np.where(change)[0]
+
+        res_keys = [(chain_id[i], res_id[i]) for i in first_pos.tolist()]
+        res_ent = entity_types[first_pos]
+
+        bonds = atom_array.bonds
+        coords = atom_array.coord
+
+        is_na = (res_ent == DNA) | (res_ent == RNA)
+        if is_na.sum() < 2:
+            return
+        for k0, k1, na0, na1 in zip(res_keys[:-1], res_keys[1:], is_na[:-1], is_na[1:]):
+            if k0[0] != k1[0]:
+                continue
+            if not (na0 and na1):
+                continue
+
+            o3 = o3_map.get(k0)
+            p1 = p_map.get(k1)
+            if o3 is None or p1 is None:
+                continue
+
+            if np.linalg.norm(coords[o3] - coords[p1]) > max_p_o3_dist:
+                continue
+
+            neigh, _ = bonds.get_bonds(o3)
+            if p1 in neigh:
+                continue
+            bonds.add_bond(o3, p1, bond_type=BondType.SINGLE)
 
     def _calculate_vdw_radii(self) -> np.ndarray:
         elements = self.atom_array.element
@@ -162,11 +399,7 @@ class StereoChemValidator:
     def _classify_inter_residue_types(self) -> np.ndarray:
         entity_mapping = {PROTEIN: "PEPTIDE", DNA: "NA", RNA: "NA"}
 
-        label_entity_ids = self.atom_array.label_entity_id
-        entity_types = np.array(
-            [self.entity_poly_type.get(eid, "OTHER") for eid in label_entity_ids],
-            dtype=object,
-        )
+        entity_types = self._entity_types
 
         inter_res_types = np.array(
             [entity_mapping.get(t, "OTHER") for t in entity_types], dtype=object
@@ -187,6 +420,11 @@ class StereoChemValidator:
         res_id = self._res_id
         coords = self.atom_array.coord
 
+        # Build a fast residue index on integer keys (avoid object np.unique)
+        unique_chains, chain_ints = np.unique(chain_id, return_inverse=True)
+        combined_res_keys = np.stack([chain_ints, res_id], axis=1)
+        _, res_indices = np.unique(combined_res_keys, axis=0, return_inverse=True)
+
         # Find CA, N indices once
         ca_mask = atom_name == "CA"
         n_mask = atom_name == "N"
@@ -204,15 +442,12 @@ class StereoChemValidator:
         if pro_indices.size == 0:
             return inter_res_types
 
-        # Pre-calculate residue indices for faster update
-        # We can use (chain_id, res_id) or just use the fact that atoms in a residue are usually contiguous.
-        # But to be safe, let's use a unique residue identifier.
-        combined_res_keys = np.stack([chain_id, res_id], axis=1)
-        _, res_indices = np.unique(combined_res_keys, axis=0, return_inverse=True)
+        # Unique proline residues (avoid Python set/sort over atoms)
+        pro_keys = np.stack([chain_ints[pro_indices], res_id[pro_indices]], axis=1)
+        pro_res_unique = np.unique(pro_keys, axis=0)
 
-        pro_res_keys = sorted(set((chain_id[i], res_id[i]) for i in pro_indices))
-
-        for c_pro, r_pro in pro_res_keys:
+        for c_pro_int, r_pro in pro_res_unique.tolist():
+            c_pro = unique_chains[c_pro_int]
             # Need prev CA (ca0), prev C (c0), current N (n1), current CA (ca1)
             # Find previous residue in the same chain
             # Since we don't know the exact residue ID of the previous one (might not be r_pro - 1)
@@ -597,19 +832,75 @@ class StereoChemValidator:
         bond_array = atom_array.bonds.as_array()[:, :2]
         all_bonds = np.concatenate([bond_array, bond_array[:, ::-1]], axis=0)
 
-        # We'll use a dictionary to store neighbor indices for each atom
-        # This is still a bit of Python, but we only do it once.
-        # Alternatively, we can use the join approach.
+        def _join_ab_bc(
+            bonds_ab: np.ndarray, bonds_bc: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            """Join (A,B) and (B,C) edges into (A,B,C) triplets.
+
+            This replaces a per-angle `pandas.merge()` with a light-weight
+            NumPy join. It still loops over shared B values, but each B has a
+            tiny neighborhood in typical bond graphs.
+            """
+
+            ab_a = bonds_ab[:, 0]
+            ab_b = bonds_ab[:, 1]
+            bc_b = bonds_bc[:, 0]
+            bc_c = bonds_bc[:, 1]
+
+            ab_order = np.argsort(ab_b, kind="mergesort")
+            bc_order = np.argsort(bc_b, kind="mergesort")
+
+            ab_b_s = ab_b[ab_order]
+            bc_b_s = bc_b[bc_order]
+
+            ab_u, ab_start, ab_cnt = np.unique(
+                ab_b_s, return_index=True, return_counts=True
+            )
+            bc_u, bc_start, bc_cnt = np.unique(
+                bc_b_s, return_index=True, return_counts=True
+            )
+
+            ia_parts: list[np.ndarray] = []
+            ib_parts: list[np.ndarray] = []
+            ic_parts: list[np.ndarray] = []
+
+            i = j = 0
+            while i < ab_u.size and j < bc_u.size:
+                b_ab = ab_u[i]
+                b_bc = bc_u[j]
+                if b_ab == b_bc:
+                    a_slice = ab_a[ab_order][ab_start[i] : ab_start[i] + ab_cnt[i]]
+                    c_slice = bc_c[bc_order][bc_start[j] : bc_start[j] + bc_cnt[j]]
+                    if a_slice.size and c_slice.size:
+                        ia_parts.append(np.repeat(a_slice, c_slice.size))
+                        ib_parts.append(
+                            np.full(a_slice.size * c_slice.size, b_ab, dtype=np.int64)
+                        )
+                        ic_parts.append(np.tile(c_slice, a_slice.size))
+                    i += 1
+                    j += 1
+                elif b_ab < b_bc:
+                    i += 1
+                else:
+                    j += 1
+
+            if not ia_parts:
+                return (
+                    np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                )
+
+            return (
+                np.concatenate(ia_parts),
+                np.concatenate(ib_parts),
+                np.concatenate(ic_parts),
+            )
 
         bad_dfs = []
         for group, params in inter_res_angle_data.items():
             for angle_key, (ideal, sigma) in params.items():
                 name_a, name_b, name_c = angle_key.split("_")
-
-                # Find all potential central atoms B
-                idx_b_all = np.where((atom_names == name_b) & (inter_types == group))[0]
-                if idx_b_all.size == 0:
-                    continue
 
                 # For each B, find neighbors A and C
                 # This part is tricky to vectorize fully without a join.
@@ -637,36 +928,23 @@ class StereoChemValidator:
                 if bonds_ab.size == 0 or bonds_bc.size == 0:
                     continue
 
-                # Join bonds_ab and bonds_bc on idx_b
-                # We can use pd.merge for a clean join
-                df_ab = pd.DataFrame(bonds_ab, columns=["idx_a", "idx_b"])
-                df_bc = pd.DataFrame(bonds_bc, columns=["idx_b", "idx_c"])
-
-                merged = pd.merge(df_ab, df_bc, on="idx_b")
-                if merged.empty:
+                ia, ib, ic = _join_ab_bc(bonds_ab, bonds_bc)
+                if ia.size == 0:
                     continue
 
                 # Filter A != C
-                merged = merged[merged["idx_a"] != merged["idx_c"]]
-                if merged.empty:
+                neq = ia != ic
+                ia, ib, ic = ia[neq], ib[neq], ic[neq]
+                if ia.size == 0:
                     continue
-
-                ia = merged["idx_a"].to_numpy()
-                ib = merged["idx_b"].to_numpy()
-                ic = merged["idx_c"].to_numpy()
 
                 # Filter: At least two distinct residues among A, B, C
                 # (chain_id, res_id) comparison
-                res_key_a = np.stack([chain_ids[ia], res_ids[ia]], axis=1)
-                res_key_b = np.stack([chain_ids[ib], res_ids[ib]], axis=1)
-                res_key_c = np.stack([chain_ids[ic], res_ids[ic]], axis=1)
-
-                # Count distinct residues in each triplet
-                # A simple way: (A != B) | (B != C) | (A != C) is not enough, we need at least 2 distinct
-                # But since they are bonded, if they are inter-residue, they must have at least 2 distinct.
-                # Original logic: len(set(res_keys)) < 2 means intra-residue.
-                is_intra = np.all(res_key_a == res_key_b, axis=1) & np.all(
-                    res_key_b == res_key_c, axis=1
+                is_intra = (
+                    (chain_ids[ia] == chain_ids[ib])
+                    & (res_ids[ia] == res_ids[ib])
+                    & (chain_ids[ib] == chain_ids[ic])
+                    & (res_ids[ib] == res_ids[ic])
                 )
 
                 ia, ib, ic = ia[~is_intra], ib[~is_intra], ic[~is_intra]
@@ -1063,9 +1341,13 @@ class StereoChemValidator:
             cys_sg_pair = is_cys_sg[idx1] & is_cys_sg[idx2]
 
             if np.any(cys_sg_pair):
+                # Make sure SG-SG is not treated *more strictly* than generic
+                # contacts. If the caller wants extra leniency they can pass a
+                # value > `tolerance`.
+                effective_tol = max(tolerance, disulfide_clash_tolerance)
                 contact_limits[cys_sg_pair] = (
                     r1[cys_sg_pair] + r2[cys_sg_pair]
-                ) - disulfide_clash_tolerance
+                ) - effective_tol
 
         # 6. Final clash filter
         clash_mask = distances < contact_limits
@@ -1154,6 +1436,10 @@ class StereoChemValidator:
             z_thresh=z_thresh,
         )
 
+        # Cache for downstream consumers (e.g. stereochemistry-aware metrics)
+        # NOTE: indices (idx*) refer to `self.atom_array`.
+        self._last_violation_dfs = (clash_df, bad_bond_df, bad_angle_df)
+
         n_atoms = len(self.atom_array)
         issue_mask = np.zeros(n_atoms, dtype=bool)
 
@@ -1235,3 +1521,186 @@ class StereoChemValidator:
         )
 
         return final_valid_mask
+
+
+def stereochem_check_to_csv(
+    model_cif: Union[str, Path],
+    output_csv: Union[str, Path],
+    *,
+    include_bonds: bool = True,
+    clash_tolerance: float = 1.5,
+    disulfide_clash_tolerance: float = 1.0,
+    z_thresh: float = 12.0,
+) -> pd.DataFrame:
+    """
+    Run stereochemistry checks for a single model CIF and write a CSV report.
+
+    Notes:
+    - This API only depends on `model_cif` and does not require a reference CIF.
+      Therefore, clash detection only uses the model's own bond graph.
+    - The output is a single CSV that concatenates all violations with a
+      `violation_type` column (clash/bond/angle).
+
+    Returns:
+        pandas.DataFrame: The merged report DataFrame (also written to `output_csv`).
+            None if no violations found.
+    """
+
+    model_cif = Path(model_cif)
+    output_csv = Path(output_csv)
+
+    model_struct = Structure.from_mmcif(model_cif, include_bonds=include_bonds)
+    checker = StereoChemValidator(struct=model_struct, ref_struct=None)
+
+    clash_df = checker.find_clashes(
+        tolerance=clash_tolerance,
+        disulfide_clash_tolerance=disulfide_clash_tolerance,
+    )
+    bad_bond_df = checker.find_bad_bonds(z_thresh=z_thresh)
+    bad_angle_df = checker.find_bad_angles(z_thresh=z_thresh)
+
+    def _format_atom_series(
+        df: pd.DataFrame,
+        *,
+        chain_col: str,
+        res_name_col: str,
+        res_id_col: str,
+        atom_name_col: str,
+    ) -> pd.Series:
+        """Format single-atom identifier as `{chain}_{res}{res_id}_{atom}`."""
+        res_id = df[res_id_col]
+        if pd.api.types.is_numeric_dtype(res_id):
+            # Avoid `12.0` when a numeric column is upcasted
+            res_id_str = res_id.astype("Int64").astype(str)
+        else:
+            res_id_str = res_id.astype(str)
+        return (
+            df[chain_col].astype(str)
+            + "_"
+            + df[res_name_col].astype(str)
+            + res_id_str
+            + "_"
+            + df[atom_name_col].astype(str)
+        )
+
+    dfs: list[pd.DataFrame] = []
+    if clash_df is not None and (not clash_df.empty):
+        a1 = _format_atom_series(
+            clash_df,
+            chain_col="chain_id1",
+            res_name_col="res_name1",
+            res_id_col="res_id1",
+            atom_name_col="atom_name1",
+        )
+        a2 = _format_atom_series(
+            clash_df,
+            chain_col="chain_id2",
+            res_name_col="res_name2",
+            res_id_col="res_id2",
+            atom_name_col="atom_name2",
+        )
+        clash_df = clash_df.assign(site=a1 + "..." + a2).drop(
+            columns=[
+                "chain_id1",
+                "res_name1",
+                "res_id1",
+                "atom_name1",
+                "chain_id2",
+                "res_name2",
+                "res_id2",
+                "atom_name2",
+            ],
+            errors="ignore",
+        )
+        dfs.append(clash_df.assign(violation_type="clash"))
+    if bad_bond_df is not None and (not bad_bond_df.empty):
+        b1 = _format_atom_series(
+            bad_bond_df,
+            chain_col="chain_id1",
+            res_name_col="res_name1",
+            res_id_col="res_id1",
+            atom_name_col="atom_name1",
+        )
+        b2 = _format_atom_series(
+            bad_bond_df,
+            chain_col="chain_id2",
+            res_name_col="res_name2",
+            res_id_col="res_id2",
+            atom_name_col="atom_name2",
+        )
+        bad_bond_df = bad_bond_df.assign(site=b1 + "-" + b2).drop(
+            columns=[
+                "chain_id1",
+                "res_name1",
+                "res_id1",
+                "atom_name1",
+                "chain_id2",
+                "res_name2",
+                "res_id2",
+                "atom_name2",
+            ],
+            errors="ignore",
+        )
+        dfs.append(bad_bond_df.assign(violation_type="bond"))
+    if bad_angle_df is not None and (not bad_angle_df.empty):
+        c1 = _format_atom_series(
+            bad_angle_df,
+            chain_col="chain_id_a",
+            res_name_col="res_name_a",
+            res_id_col="res_id_a",
+            atom_name_col="atom_name_a",
+        )
+        c2 = _format_atom_series(
+            bad_angle_df,
+            chain_col="chain_id_b",
+            res_name_col="res_name_b",
+            res_id_col="res_id_b",
+            atom_name_col="atom_name_b",
+        )
+        c3 = _format_atom_series(
+            bad_angle_df,
+            chain_col="chain_id_c",
+            res_name_col="res_name_c",
+            res_id_col="res_id_c",
+            atom_name_col="atom_name_c",
+        )
+        bad_angle_df = bad_angle_df.assign(site=c1 + "-" + c2 + "-" + c3).drop(
+            columns=[
+                "chain_id_a",
+                "res_name_a",
+                "res_id_a",
+                "atom_name_a",
+                "chain_id_b",
+                "res_name_b",
+                "res_id_b",
+                "atom_name_b",
+                "chain_id_c",
+                "res_name_c",
+                "res_id_c",
+                "atom_name_c",
+                "idx_a",
+                "idx_b",
+                "idx_c",
+            ],
+            errors="ignore",
+        )
+        dfs.append(bad_angle_df.assign(violation_type="angle"))
+
+    if len(dfs) == 0:
+        report_df = pd.DataFrame(columns=["violation_type"])
+    else:
+        report_df = pd.concat(dfs, axis=0, ignore_index=True, sort=False)
+
+    if report_df.empty:
+        # No violations found
+        return
+
+    # Put violation_type first if present
+    if "violation_type" in report_df.columns:
+        first_cols = [c for c in ["violation_type", "site"] if c in report_df.columns]
+        rest_cols = [c for c in report_df.columns if c not in set(first_cols)]
+        report_df = report_df[first_cols + rest_cols]
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    report_df.to_csv(output_csv, index=False)
+    return report_df

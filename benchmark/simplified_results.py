@@ -26,6 +26,8 @@ KEPT_RANKER = [
     "best.ranking_score",
     "best.chain_pair_iptm",
     "best.chain_ptm",
+    # af2
+    "best.plddt",
     # af2m
     "best.iptm+ptm",
     # chai
@@ -44,8 +46,6 @@ EVAL_TYPE_MAP = {
     "Intra-RNA": "intra_rna",
     "Intra-DNA": "intra_dna",
     "Intra-Ligand": "intra_lig",
-    "Protein-Protein (Antibody=True)": "prot_prot (ab=True)",
-    "Protein-Protein (Antibody=False)": "prot_prot (ab=False)",
     "Protein-Protein": "prot_prot",
     "DNA-DNA": "dna_dna",
     "RNA-RNA": "rna_rna",
@@ -56,7 +56,6 @@ EVAL_TYPE_MAP = {
     "DNA-RNA": "dna_rna",
     "DNA-Ligand": "dna_lig",
     "RNA-Ligand": "rna_lig",
-    "Intra-Protein (Monomer)": "intra_prot (monomer)",
 }
 
 
@@ -74,8 +73,8 @@ def reduce_dockq_csv(dockq_csv: Path | str) -> pd.DataFrame:
 
     df_list = []
     num_cols = {"name": "entry_id_num/cluster_num"}
-    for eval_info, eval_type_df in df.groupby(["eval_dataset", "eval_type"]):
-        eval_dataset, eval_type = eval_info
+    for eval_info, eval_type_df in df.groupby(["eval_dataset", "eval_type", "subset"]):
+        eval_dataset, eval_type, subset = eval_info
 
         eval_type_df = eval_type_df[eval_type_df["ranker"].isin(KEPT_RANKER)]
         sub_eval_type_df = eval_type_df[["name", "ranker", "avg_dockq_sr_avg_sr"]]
@@ -86,6 +85,9 @@ def reduce_dockq_csv(dockq_csv: Path | str) -> pd.DataFrame:
             new_col_name = (
                 f"[{eval_dataset}]{EVAL_TYPE_MAP.get(eval_type, eval_type)} DockQ SR"
             )
+
+        if subset != "All":
+            new_col_name += f" ({subset})"
 
         new_sub_eval_type_df = sub_eval_type_df.rename(
             columns={"avg_dockq_sr_avg_sr": new_col_name}
@@ -119,8 +121,8 @@ def reduce_lddt_csv(lddt_csv: Path | str) -> pd.DataFrame:
 
     df_list = []
     num_cols = {"name": "entry_id_num/cluster_num"}
-    for eval_info, eval_type_df in df.groupby(["eval_dataset", "eval_type"]):
-        eval_dataset, eval_type = eval_info
+    for eval_info, eval_type_df in df.groupby(["eval_dataset", "eval_type", "subset"]):
+        eval_dataset, eval_type, subset = eval_info
 
         eval_type_df = eval_type_df[eval_type_df["ranker"].isin(KEPT_RANKER)]
         sub_eval_type_df = eval_type_df[["name", "ranker", "lddt"]]
@@ -129,6 +131,9 @@ def reduce_lddt_csv(lddt_csv: Path | str) -> pd.DataFrame:
             new_col_name = f"{EVAL_TYPE_MAP.get(eval_type, eval_type)}"
         else:
             new_col_name = f"[{eval_dataset}]{EVAL_TYPE_MAP.get(eval_type, eval_type)}"
+
+        if subset != "All":
+            new_col_name += f" ({subset})"
 
         new_sub_eval_type_df = sub_eval_type_df.rename(columns={"lddt": new_col_name})
         num_cols[
@@ -157,22 +162,37 @@ def reduce_rmsd_csv(lddt_csv: Path | str) -> pd.DataFrame:
     """
     df = pd.read_csv(lddt_csv)
 
-    sub_df = df[df["ranker"].isin(KEPT_RANKER)]
-    sub_df = sub_df[["name", "ranker", "lig_rmsd_sr"]]
-    new_sub_df = sub_df.rename(columns={"lig_rmsd_sr": "PoseBusters SR"})
-    new_sub_df = new_sub_df.round(4)
-    new_sub_df = pd.concat(
-        [
-            pd.DataFrame(
-                {
-                    "name": "entry_id_num/cluster_num",
-                    "PoseBusters SR": f"{df['entry_id_num'].iloc[0]}/null",
-                },
-                index=[0],
-            ),
-            new_sub_df,
-        ]
-    )
+    sub_df = df[df["ranker"].isin(KEPT_RANKER)].copy()
+
+    metric_rename_map = {
+        "lig_rmsd_sr": "Ligand RMSD SR",
+        "pb_all_valid_sr": "PB Valid SR",
+        "pb_all_valid_and_good_rmsd_sr": "PB Valid and Good RMSD SR",
+    }
+
+    available_metric_cols = [
+        col for col in metric_rename_map.keys() if col in sub_df.columns
+    ]
+    available_metric_rename = {
+        col: metric_rename_map[col] for col in available_metric_cols
+    }
+
+    base_cols = ["name", "ranker"]
+    sub_df = sub_df[base_cols + available_metric_cols].copy()
+    new_sub_df = sub_df.rename(columns=available_metric_rename)
+
+    num_cols = new_sub_df.select_dtypes(include="number").columns
+    if len(num_cols) > 0:
+        new_sub_df[num_cols] = new_sub_df[num_cols].round(4)
+
+    entry_cluster = f"{df['entry_id_num'].iloc[0]}/{df['cluster_num'].iloc[0]}"
+
+    summary_row = {"name": "entry_id_num/cluster_num"}
+    for pretty_name in available_metric_rename.values():
+        summary_row[pretty_name] = entry_cluster
+
+    header_df = pd.DataFrame([summary_row], columns=new_sub_df.columns)
+    new_sub_df = pd.concat([header_df, new_sub_df], ignore_index=True)
     return new_sub_df
 
 
@@ -229,11 +249,37 @@ def reduce_csv_content(
         )
 
     df_reordered = pd.concat([rows_with_num, other_rows], ignore_index=True)
-    columns_to_move = ["name", "ranker"]
 
-    new_order = columns_to_move + [
-        col for col in df_reordered.columns if col not in columns_to_move
+    preferred_columns = [
+        "name",
+        "num_token",
+        "ranker",
+        "prot_prot DockQ SR",
+        "prot_prot DockQ SR (Antibody=False)",
+        "prot_prot DockQ SR (Antibody=True)",
+        "dna_dna",
+        "dna_lig",
+        "dna_prot",
+        "dna_rna",
+        "intra_dna",
+        "intra_lig",
+        "intra_prot",
+        "intra_prot (Monomer)",
+        "intra_rna",
+        "prot_lig",
+        "prot_prot",
+        "prot_prot (Antibody=False)",
+        "prot_prot (Antibody=True)",
+        "prot_prot (Peptide)",
+        "rna_lig",
+        "rna_prot",
+        "rna_rna",
     ]
+
+    existing_cols = list(df_reordered.columns)
+    priority_cols = [c for c in preferred_columns if c in existing_cols]
+    remaining_cols = [c for c in existing_cols if c not in priority_cols]
+    new_order = priority_cols + remaining_cols
     df_reordered = df_reordered[new_order]
 
     df_reordered = df_reordered.fillna("")
@@ -273,7 +319,10 @@ def rank_results_df(result_df: pd.DataFrame, metrics_col: str) -> pd.DataFrame:
     if "subset" not in result_df.columns:
         result_df["subset"] = "All"
 
-    group_cols = ["eval_dataset", "subset", "eval_type", "ranker"]
+    group_cols = ["eval_dataset"]
+    for i in ["subset", "eval_type", "ranker"]:
+        if i in result_df.columns:
+            group_cols.append(i)
 
     results = []
     for group, sub_df in result_df.groupby(group_cols):
@@ -284,7 +333,7 @@ def rank_results_df(result_df: pd.DataFrame, metrics_col: str) -> pd.DataFrame:
 
         rank_list = []
         for _, row in sorted_sub_df.iterrows():
-            row_str = f"{row['name']} ({row[metrics_col]})"
+            row_str = f"{row['name']} ({round(row[metrics_col], 4)})"
             rank_list.append(row_str)
         results.append(
             group_list + [entry_id_num, cluster_id_num] + [" > ".join(rank_list)]
@@ -299,6 +348,7 @@ def rank_results_df(result_df: pd.DataFrame, metrics_col: str) -> pd.DataFrame:
 def get_ranked_results(
     dockq_csv: Path | str | None = None,
     lddt_csv: Path | str | None = None,
+    rmsd_csv: Path | str | None = None,
     output_csv: Path | str | None = None,
 ):
     """
@@ -329,10 +379,27 @@ def get_ranked_results(
         ranked_lddt_df.insert(0, "metric", "LDDT")
         df_list.append(ranked_lddt_df)
 
+    if rmsd_csv is not None and Path(rmsd_csv).exists():
+        rmsd_df = pd.read_csv(rmsd_csv)
+
+        for metrics_col, metric_name in [
+            ("lig_rmsd_sr", "Ligand_RMSD_SR"),
+            ("pb_all_valid_sr", "PB_Valid_SR"),
+            ("pb_all_valid_and_good_rmsd_sr", "PB_Valid_and_Good_RMSD_SR"),
+        ]:
+            if metrics_col not in rmsd_df.columns:
+                continue
+            ranked_rmsd_df = rank_results_df(rmsd_df, metrics_col=metrics_col)
+            ranked_rmsd_df.insert(0, "metric", metric_name)
+            df_list.append(ranked_rmsd_df)
+
     output_df = pd.concat(df_list)
-    output_df.sort_values(
-        by=["metric", "ranker", "eval_dataset", "subset", "eval_type"], inplace=True
-    )
+    sorted_keys = [
+        i
+        for i in ["metric", "ranker", "eval_dataset", "subset", "eval_type"]
+        if i in output_df.columns
+    ]
+    output_df.sort_values(by=sorted_keys, inplace=True)
     output_df.to_csv(output_csv, index=False, quoting=csv.QUOTE_NONNUMERIC)
 
 
@@ -376,7 +443,7 @@ def run_reduce(
         f.write(table_str)
 
     output_ranked_csv.parent.mkdir(exist_ok=True, parents=True)
-    get_ranked_results(dockq_csv, lddt_csv, output_csv=output_ranked_csv)
+    get_ranked_results(dockq_csv, lddt_csv, rmsd_csv, output_csv=output_ranked_csv)
 
 
 if __name__ == "__main__":
