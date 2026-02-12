@@ -121,7 +121,7 @@ git clone https://github.com/bytedance/PXMeter.git
 cd PXMeter
 ```
 
-- The **[Benchmark Documentation](docs/benchmark.md)** explains how to run evaluations on model predictions and how the aggregated metrics are computed.
+- The **[Benchmark Documentation](docs/benchmark.md)** explains how to run evaluations on model predictions and how the aggregated metrics are computed. If you want to use the pre-made **[PXM series datasets](docs/available_datasets.md)**, you should also refer to this instruction.
 - The **[Dataset Pipeline Overview](docs/datapipeline.md)** describes the complete construction of the RecentPDB low-homology dataset,
 including filtering, homology scans, clustering, and subset labeling.
 The pipeline also allows users to **rebuild the evaluation dataset from scratch using any custom time window**.
