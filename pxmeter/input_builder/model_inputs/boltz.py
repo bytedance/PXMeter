@@ -190,12 +190,14 @@ class BoltzInput:
                             seq_obj_lst.append(
                                 LigandChainSequence(
                                     ccd_codes=tuple([info_dict["ccd"]]),
+                                    ori_chain_id=chain_id,
                                 )
                             )
                         elif "smiles" in info_dict:
                             seq_obj_lst.append(
                                 LigandChainSequence(
                                     smiles=info_dict["smiles"],
+                                    ori_chain_id=chain_id,
                                 )
                             )
                         else:
@@ -219,6 +221,7 @@ class BoltzInput:
                                 sequence=info_dict["sequence"],
                                 entity_type=entity_type_mapping[entity_type],
                                 modifications=tuple(modifications),
+                                ori_chain_id=chain_id,
                             )
                         )
                         chain_id_to_idx[chain_id] = len(seq_obj_lst) - 1
@@ -281,6 +284,14 @@ class BoltzInput:
 
         idx_to_chain_id = {}
         seqs_to_chain_ids = defaultdict(list)
+
+        # Determine unique chain ID for each sequence
+        # Prioritize ori_chain_id, generate unique ID if missing.
+        existing_chain_ids = {
+            seq.ori_chain_id for seq in self.sequences if seq.ori_chain_id
+        }
+        next_chain_id_int = 1
+
         for idx, seq in enumerate(self.sequences):
             if not seq.is_polymer():
                 if seq.ccd_codes and len(seq.ccd_codes) > 1:
@@ -290,7 +301,18 @@ class BoltzInput:
                         seq.ccd_codes,
                     )
                     continue
-            chain_id = int_to_letters(idx + 1)
+
+            if seq.ori_chain_id:
+                chain_id = seq.ori_chain_id
+            else:
+                while True:
+                    candidate = int_to_letters(next_chain_id_int)
+                    next_chain_id_int += 1
+                    if candidate not in existing_chain_ids:
+                        chain_id = candidate
+                        existing_chain_ids.add(chain_id)
+                        break
+            
             idx_to_chain_id[idx] = chain_id
             seqs_to_chain_ids[seq].append(chain_id)
 

@@ -31,6 +31,7 @@ from pxmeter.constants import (
 from pxmeter.input_builder.constants import VALID_INPUT_TYPES, VALID_OUTPUT_TYPES
 from pxmeter.input_builder.model_inputs.alphafold3 import AlpahFold3Input
 from pxmeter.input_builder.model_inputs.boltz import BoltzInput
+from pxmeter.input_builder.model_inputs.openfold3 import OpenFold3Input
 from pxmeter.input_builder.model_inputs.protenix import ProtenixInput
 from pxmeter.input_builder.seq import (
     Bond,
@@ -177,6 +178,10 @@ def run_interactive_gen():
                     ).to_sequences()
                 elif in_type == "boltz":
                     loaded_seqs_obj = BoltzInput.from_yaml_file(
+                        file_path
+                    ).to_sequences()
+                elif in_type == "openfold3":
+                    loaded_seqs_obj = OpenFold3Input.from_json_file(
                         file_path
                     ).to_sequences()
                 else:
@@ -427,7 +432,7 @@ def run_interactive_gen():
                 )
 
                 # Validation for file_path
-                if l_input_type == "f" and output_type in ["af3", "boltz"]:
+                if l_input_type == "f" and output_type in ["af3", "boltz", "openfold3"]:
                     print(
                         f"\nError: {output_type.upper()} does not support "
                         "ligand input via file_path."
@@ -667,19 +672,19 @@ def run_interactive_gen():
         output_f = input("File path cannot be empty: ").strip()
     output_f = Path(output_f)
 
-    seeds = [42]
-    if output_type != "boltz":
+    seeds = None
+    if output_type not in ["boltz", "openfold3"]:
         while True:
             seeds_str = input(
-                "Enter model seeds (comma separated, default: 42): "
+                "Enter model seeds (comma separated, default: None): "
             ).strip()
             if not seeds_str:
-                seeds = [42]
+                seeds = None
                 break
             try:
                 seeds = [int(x.strip()) for x in seeds_str.split(",") if x.strip()]
                 if not seeds:
-                    seeds = [42]
+                    seeds = None
                 break
             except ValueError:
                 print(
@@ -689,12 +694,17 @@ def run_interactive_gen():
     seqs_obj = Sequences(name=name, sequences=tuple(all_seqs), bonds=tuple(all_bonds))
 
     output_f.parent.mkdir(parents=True, exist_ok=True)
+    if seeds is None:
+        seeds = [42]
+
     if output_type == "af3":
         AlpahFold3Input.from_sequences(seqs_obj, seeds).to_json_file(output_f)
     elif output_type == "protenix":
         ProtenixInput.from_sequences(seqs_obj, seeds).to_json_file(output_f)
     elif output_type == "boltz":
         BoltzInput.from_sequences(seqs_obj).to_yaml_file(output_f)
+    elif output_type == "openfold3":
+        OpenFold3Input.from_sequences(seqs_obj).to_json_file(output_f)
 
     print("\n" + "=" * 40)
     print(f"Successfully generated {output_type.upper()} input file at:")

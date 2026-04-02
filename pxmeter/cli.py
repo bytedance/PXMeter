@@ -319,6 +319,26 @@ def update():
     default=-1,
     help="Number of CPUs to use. Defaults to -1 (all available).",
 )
+@click.option(
+    "--keep_polymer_crosslinks",
+    is_flag=True,
+    help="Keep polymer-polymer crosslinks (e.g. (e.g. disulfide bonds, cyclic-peptides)) in the bonds list.",
+)
+@click.option(
+    "-rm",
+    "--remove-entity-types",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated list of entity types to remove from the input. "
+        "Choices: ligand, ion, glycan, protein, dna, rna, covalent_ligand."
+    ),
+)
+@click.option(
+    "--reassign-chain-id",
+    is_flag=True,
+    help="Reassign chain IDs, ignoring original ones from the input file.",
+)
 def gen_input_cli(
     input_path: Optional[Path],
     output_path: Optional[Path],
@@ -330,6 +350,9 @@ def gen_input_cli(
     assembly_id: Optional[str] = None,
     pdb_ids: Optional[str] = None,
     num_cpu: int = -1,
+    keep_polymer_crosslinks: bool = False,
+    remove_entity_types: Optional[str] = None,
+    reassign_chain_id: bool = False,
 ):
     """
     Generate model inputs.
@@ -352,6 +375,12 @@ def gen_input_cli(
     else:
         seeds_lst = None
 
+    remove_entity_types_lst = None
+    if remove_entity_types:
+        remove_entity_types_lst = [
+            x.strip().lower() for x in remove_entity_types.split(",") if x.strip()
+        ]
+
     run_gen_input(
         input_path,
         output_path,
@@ -362,4 +391,7 @@ def gen_input_cli(
         assembly_id=assembly_id,
         pdb_ids=pdb_ids,
         num_cpu=num_cpu,
+        keep_polymer_crosslinks=keep_polymer_crosslinks,
+        remove_entity_types=remove_entity_types_lst,
+        use_ori_chain_id=not reassign_chain_id,
     )

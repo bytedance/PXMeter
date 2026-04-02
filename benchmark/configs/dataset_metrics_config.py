@@ -25,7 +25,7 @@ DATASET_METRICS_CONFIG = {
             "subset_label": None,
             "inverse_subset": False,
             "eval_type": None,
-            "metric": ["dockq", "lddt", "rmsd"],
+            "metric": ["dockq", "lddt", "rmsd", "cdr_h3_bb_rmsd"],
         },
         {
             "subset": "Antibody=True",
@@ -105,7 +105,7 @@ DATASET_METRICS_CONFIG = {
             "subset_label": None,
             "inverse_subset": False,
             "eval_type": None,
-            "metric": ["lddt", "rmsd", "dockq"],
+            "metric": ["lddt", "rmsd", "dockq", "cdr_h3_bb_rmsd"],
         },
     ],
 }

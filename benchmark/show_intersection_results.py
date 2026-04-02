@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -27,7 +28,11 @@ from tqdm import tqdm
 from benchmark.aggregator import run_aggregator
 from benchmark.configs.data_config import SUPPORTED_DATA
 from benchmark.configs.dataset_metrics_config import DATASET_METRICS_CONFIG
-from benchmark.show_results import ChainInterfaceDisplayer, RMSDDisplayer
+from benchmark.show_results import (
+    CDRH3Displayer,
+    ChainInterfaceDisplayer,
+    RMSDDisplayer,
+)
 from benchmark.simplified_results import run_reduce
 from benchmark.utils import (
     add_cluster_id_to_df,
@@ -35,6 +40,14 @@ from benchmark.utils import (
     query_subset_labels,
     select_df_by_eval_types,
 )
+
+
+@dataclass
+class MetricsDisplayers:
+    displayer: ChainInterfaceDisplayer
+    valid_chain_displayer: ChainInterfaceDisplayer
+    rmsd_displayer: RMSDDisplayer | None = None
+    cdr_displayer: CDRH3Displayer | None = None
 
 
 def get_af3_ab_sub_df(metrics_df: pd.DataFrame) -> pd.DataFrame:
@@ -109,9 +122,346 @@ def get_low_homology_subset(
     return metrics_keys.isin(lowh_df_keys)
 
 
+def _filter_by_valid_chain_id(
+    metrics_df: pd.DataFrame, aux_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Filter metrics DataFrame based on chain ID validity in aux_df.
+
+    Args:
+        metrics_df (pd.DataFrame): The metrics DataFrame to filter.
+        aux_df (pd.DataFrame): The auxiliary DataFrame containing valid chain information.
+
+    Returns:
+        pd.DataFrame: A filtered DataFrame containing only rows with valid chain IDs.
+    """
+    if metrics_df.empty or aux_df.empty:
+        return metrics_df.iloc[:0]
+
+    # chain_rows: keep entry_id, chain_id_1
+    chain_mask = aux_df["type"] == "chain"
+    chain_df = aux_df.loc[chain_mask, ["entry_id", "chain_id_1"]].copy()
+
+    # interface_rows: keep entry_id, chain_id_1 AND entry_id, chain_id_2 (renamed to chain_id_1)
+    interface_mask = aux_df["type"] == "interface"
+
+    if1 = aux_df.loc[interface_mask, ["entry_id", "chain_id_1"]].copy()
+
+    if2 = aux_df.loc[interface_mask, ["entry_id", "chain_id_2"]].copy()
+    if2 = if2.rename(columns={"chain_id_2": "chain_id_1"})
+
+    valid_df = pd.concat([chain_df, if1, if2], ignore_index=True).drop_duplicates()
+
+    # Set index for faster lookup
+    # Using MultiIndex intersection
+    valid_index = pd.MultiIndex.from_frame(valid_df)
+
+    # We use a temporary index based on entry_id and chain_id_1 for matching
+    metrics_index = pd.MultiIndex.from_frame(metrics_df[["entry_id", "chain_id_1"]])
+
+    mask = metrics_index.isin(valid_index)
+    return metrics_df[mask].copy()
+
+
+def get_valid_chain_mask(metrics_df: pd.DataFrame, aux_df: pd.DataFrame) -> pd.Series:
+    """
+    Get a boolean mask for metrics_df based on valid chains in aux_df.
+    Similar to _filter_by_valid_chain_id but returns a mask.
+    """
+    if metrics_df.empty or aux_df.empty:
+        return pd.Series(False, index=metrics_df.index)
+
+    # chain_rows: keep entry_id, chain_id_1
+    chain_mask = aux_df["type"] == "chain"
+    chain_df = aux_df.loc[chain_mask, ["entry_id", "chain_id_1"]].copy()
+
+    # interface_rows: keep entry_id, chain_id_1 AND entry_id, chain_id_2 (renamed to chain_id_1)
+    interface_mask = aux_df["type"] == "interface"
+
+    if1 = aux_df.loc[interface_mask, ["entry_id", "chain_id_1"]].copy()
+    if2 = aux_df.loc[interface_mask, ["entry_id", "chain_id_2"]].copy()
+    if2 = if2.rename(columns={"chain_id_2": "chain_id_1"})
+
+    valid_df = pd.concat([chain_df, if1, if2], ignore_index=True).drop_duplicates()
+
+    # Set index for faster lookup
+    valid_index = pd.MultiIndex.from_frame(valid_df)
+
+    # We use a temporary index based on entry_id and chain_id_1 for matching
+    metrics_index = pd.MultiIndex.from_frame(metrics_df[["entry_id", "chain_id_1"]])
+
+    return metrics_index.isin(valid_index)
+
+
+def _load_pb_valid_df(
+    trial_name_to_metrics_file: dict[str, tuple[Path, ...]], dataset_name: str
+) -> pd.DataFrame | None:
+    metrics_files = trial_name_to_metrics_file[dataset_name]
+    pb_dfs = []
+
+    for metrics_file in metrics_files:
+        pb_metrics_file = Path(str(metrics_file).replace("_metrics.", "_pb_valid."))
+
+        if not pb_metrics_file.exists():
+            continue
+
+        if str(pb_metrics_file).endswith(".parquet"):
+            pb_valid_df = pd.read_parquet(pb_metrics_file, engine="pyarrow")
+            for col in ["entry_id", "seed", "sample"]:
+                pb_valid_df[col] = pb_valid_df[col].astype("string")
+        else:
+            pb_valid_df = pd.read_csv(
+                pb_metrics_file,
+                dtype={"entry_id": str, "seed": str, "sample": str},
+                low_memory=False,
+            )
+        pb_dfs.append(pb_valid_df)
+
+    if not pb_dfs:
+        return None
+
+    return pd.concat(pb_dfs, ignore_index=True)
+
+
+def _prepare_metrics_df(
+    sub_metrics_df: pd.DataFrame, eval_dataset: str
+) -> tuple[pd.DataFrame, pd.DataFrame | None, str]:
+    working_metrics_df = sub_metrics_df
+    aux_df = None
+    config_key = eval_dataset
+    if eval_dataset == "dsDNA-Protein":
+        config_key = "DNA-Protein"
+
+    if config_key not in DATASET_METRICS_CONFIG:
+        raise NotImplementedError(f"Unknown dataset {eval_dataset}")
+
+    if eval_dataset == "RecentPDB":
+        aux_df = pd.read_csv(
+            SUPPORTED_DATA.recentpdb_low_homology,
+            dtype={
+                "entry_id": str,
+                "entity_id_1": str,
+                "entity_id_2": str,
+                "chain_id_1": str,
+                "chain_id_2": str,
+            },
+        )
+        working_metrics_df = sub_metrics_df[
+            get_low_homology_subset(sub_metrics_df, aux_df)
+        ]
+    elif eval_dataset == "AF3-AB":
+        working_metrics_df = get_af3_ab_sub_df(sub_metrics_df)
+    elif eval_dataset == "dsDNA-Protein":
+        dsdna_metrics_df = sub_metrics_df.copy()
+        dsdna_metrics_df = select_df_by_eval_types(dsdna_metrics_df, ["DNA-Protein"])
+        dsdna_metrics_df["lddt_mean"] = dsdna_metrics_df.groupby(
+            ["entry_id", "sample", "seed"]
+        )["lddt"].transform("mean")
+        working_metrics_df = (
+            dsdna_metrics_df.drop_duplicates(subset=["entry_id", "sample", "seed"])
+            .drop(columns=["lddt"])
+            .rename(columns={"lddt_mean": "lddt"})
+        )
+
+    return working_metrics_df, aux_df, config_key
+
+
+def _initialize_displayers(
+    working_metrics_df: pd.DataFrame,
+    sub_metrics_df: pd.DataFrame,
+    aux_df: pd.DataFrame | None,
+    pb_valid_df: pd.DataFrame | None,
+    model: str,
+    seeds: list[str | int] | None,
+    eval_dataset: str,
+) -> tuple[MetricsDisplayers, pd.DataFrame]:
+    if eval_dataset == "RecentPDB":
+        valid_chain_metrics_df = _filter_by_valid_chain_id(sub_metrics_df, aux_df)
+    else:
+        valid_chain_metrics_df = working_metrics_df
+
+    displayer = ChainInterfaceDisplayer(working_metrics_df, model=model, seeds=seeds)
+
+    rmsd_displayer = None
+    if (
+        "lig_rmsd" in valid_chain_metrics_df.columns
+        or "lig_rmsd_wo_refl" in valid_chain_metrics_df.columns
+    ):
+        rmsd_displayer = RMSDDisplayer(
+            valid_chain_metrics_df,
+            pb_valid_df=pb_valid_df,
+            model=model,
+            seeds=seeds,
+        )
+
+    valid_chain_displayer = ChainInterfaceDisplayer(
+        valid_chain_metrics_df, model=model, seeds=seeds
+    )
+
+    cdr_displayer = None
+    if "cdr_h3_bb_rmsd" in valid_chain_metrics_df.columns:
+        cdr_displayer = CDRH3Displayer(valid_chain_metrics_df, model, seeds)
+
+    return (
+        MetricsDisplayers(
+            displayer=displayer,
+            valid_chain_displayer=valid_chain_displayer,
+            rmsd_displayer=rmsd_displayer,
+            cdr_displayer=cdr_displayer,
+        ),
+        valid_chain_metrics_df,
+    )
+
+
+def _get_subset_masks(
+    config: dict,
+    eval_dataset: str,
+    aux_df: pd.DataFrame | None,
+    working_metrics_df: pd.DataFrame,
+    valid_chain_metrics_df: pd.DataFrame,
+) -> tuple[pd.Series | None, pd.Series | None]:
+    mask = None
+    mask_valid = None
+
+    if config["subset_label"] and eval_dataset == "RecentPDB" and aux_df is not None:
+        subset_labels = [
+            lbl.strip()
+            for lbl in str(config["subset_label"]).split(";")
+            if str(lbl).strip()
+        ]
+
+        for subset_label in subset_labels:
+            target_lowh_entries = query_subset_labels(aux_df["subset"], subset_label)
+
+            label_mask = get_low_homology_subset(
+                working_metrics_df, aux_df[target_lowh_entries]
+            )
+
+            if mask is None:
+                mask = label_mask
+            else:
+                mask &= label_mask
+
+            # Use get_valid_chain_mask to handle interface-to-chain decomposition
+            label_mask_valid = get_valid_chain_mask(
+                valid_chain_metrics_df, aux_df[target_lowh_entries]
+            )
+            if mask_valid is None:
+                mask_valid = label_mask_valid
+            else:
+                mask_valid &= label_mask_valid
+
+    if config["inverse_subset"]:
+        if mask is not None:
+            mask = ~mask
+        if mask_valid is not None:
+            mask_valid = ~mask_valid
+
+    return mask, mask_valid
+
+
+def _compute_metric_results(
+    config: dict,
+    displayers: MetricsDisplayers,
+    masks: dict,
+    eval_dataset: str,
+    results_lists: dict,
+    details_lists: dict,
+):
+    subset_name = config["subset"]
+    eval_types = config["eval_type"]
+    metrics = config["metric"]
+
+    displayer = displayers.displayer
+    valid_chain_displayer = displayers.valid_chain_displayer
+    rmsd_displayer = displayers.rmsd_displayer
+    cdr_displayer = displayers.cdr_displayer
+
+    mask = masks["mask"]
+    mask_valid = masks["mask_valid"]
+
+    for metric in metrics:
+        if metric == "dockq":
+            res, det = displayer.get_dockq_sr_by_cluster(
+                mask_on_metrics_df=mask,
+                eval_types=eval_types,
+                subset_name=subset_name,
+            )
+            results_lists["dockq"].append(res)
+            details_lists["dockq"].append(det)
+
+        elif metric == "lddt":
+            res, det = displayer.get_lddt_by_cluster(
+                mask_on_metrics_df=mask,
+                eval_types=eval_types,
+                subset_name=subset_name,
+            )
+            if eval_dataset == "dsDNA-Protein":
+                res["eval_type"] = "dsDNA-Protein"
+                det["eval_type"] = "dsDNA-Protein"
+                det["chain_id_1"] = pd.NA
+                det["chain_id_2"] = pd.NA
+
+            results_lists["lddt"].append(res)
+            details_lists["lddt"].append(det)
+
+            # Check if lddt_pli column exists and compute it using ChainInterfaceDisplayer
+            if "lddt_pli" in valid_chain_displayer.metrics_df.columns:
+                res_pli, det_pli = valid_chain_displayer.get_lddt_pli(
+                    mask_on_metrics_df=mask_valid,
+                    subset_name=subset_name,
+                )
+                if not res_pli.empty:
+                    results_lists["lddt"].append(res_pli)
+                    details_lists["lddt"].append(det_pli)
+
+        elif metric == "rmsd":
+            if rmsd_displayer:
+                res, det = rmsd_displayer.get_rmsd(
+                    mask_on_metrics_df=mask_valid,
+                    subset_name=subset_name,
+                )
+
+                res_combined = rmsd_displayer.get_ligand_combined_metrics(
+                    mask_on_metrics_df=mask_valid,
+                    subset_name=subset_name,
+                )
+                if not res_combined.empty:
+                    if not res.empty:
+                        cols_to_use = [
+                            c
+                            for c in res_combined.columns
+                            if c not in ["entry_id_num", "cluster_num"]
+                        ]
+                        res = pd.merge(
+                            res,
+                            res_combined[cols_to_use],
+                            on=["ranker", "subset"],
+                            how="outer",
+                        )
+                    else:
+                        res = res_combined
+
+                results_lists["rmsd"].append(res)
+                details_lists["rmsd"].append(det)
+
+        elif metric == "cdr_h3_bb_rmsd":
+            if cdr_displayer:
+                res, det = cdr_displayer.get_cdr_h3_rmsd(
+                    success_threshold=1.0,
+                    mask_on_metrics_df=mask_valid,
+                    subset_name=subset_name,
+                )
+                results_lists["rmsd"].append(res)
+                details_lists["rmsd"].append(det)
+
+        else:
+            raise NotImplementedError(f"Unknown metric {metric}")
+
+
 def _find_result_csv(
     eval_info_dict: dict, trials: list[str]
-) -> dict[str, dict[str, Path]]:
+) -> dict[str, dict[str, tuple[Path, ...]]]:
     """
     Find the result CSV files for the specified trials.
 
@@ -125,33 +475,41 @@ def _find_result_csv(
         trials (list[str]): A list of trial names for which to find result CSV files.
 
     Returns:
-        dict[str, dict[str, Path]]: A dictionary mapping trial names to a dictionary of
+        dict[str, dict[str, tuple[Path, ...]]]: A dictionary mapping dataset names to a dictionary of
         trial names to result CSV file paths.
     """
-    # {"RecentPDB" or "PoseBusters": {trial_name: csv_path}}
+    # {"RecentPDB" or "PoseBusters": {trial_name: tuple(csv_path)}}
     trial_name_to_result_files = defaultdict(dict)
     for trial_name, trial_dict in eval_info_dict.items():
         if trial_name not in trials:
             continue
 
         for eval_dataset, dataset_path in trial_dict["dataset_path"].items():
-            eval_result_dir = Path(dataset_path)
-            if not eval_result_dir.exists():
-                logging.warning("%s does not exist", eval_result_dir)
-                continue
+            dataset_paths = [p.strip() for p in str(dataset_path).split(",")]
+            result_csvs = []
+            for dp in dataset_paths:
+                eval_result_dir = Path(dp)
+                if not eval_result_dir.exists():
+                    logging.warning("%s does not exist", eval_result_dir)
+                    continue
 
-            if eval_result_dir.name.endswith(".csv") or eval_result_dir.name.endswith(
-                ".parquet"
-            ):
-                result_csv = eval_result_dir
-            else:
-                result_csv = Path(
-                    eval_result_dir.parent / f"{eval_result_dir.name}_metrics.parquet"
+                if eval_result_dir.name.endswith(
+                    ".csv"
+                ) or eval_result_dir.name.endswith(".parquet"):
+                    result_csv = eval_result_dir
+                else:
+                    result_csv = Path(
+                        eval_result_dir.parent
+                        / f"{eval_result_dir.name}_metrics.parquet"
+                    )
+                    if result_csv.with_suffix(".csv").exists():
+                        result_csv = result_csv.with_suffix(".csv")
+
+                result_csvs.append(result_csv)
+            if result_csvs:
+                trial_name_to_result_files[eval_dataset][trial_name] = tuple(
+                    result_csvs
                 )
-                if result_csv.with_suffix(".csv").exists():
-                    result_csv = result_csv.with_suffix(".csv")
-
-            trial_name_to_result_files[eval_dataset][trial_name] = result_csv
     return trial_name_to_result_files
 
 
@@ -177,21 +535,22 @@ def gen_aggregated_results(
     for _eval_dataset, trial_name_to_csv_path in trial_name_to_result_files.items():
         if not trial_name_to_csv_path:
             continue
-        for _trial_name, metrics_csv in trial_name_to_csv_path.items():
-            eval_result_dir = metrics_csv.parent / str(metrics_csv.name).replace(
-                "_metrics.csv", ""
-            ).replace("_metrics.parquet", "")
+        for _trial_name, metrics_csvs in trial_name_to_csv_path.items():
+            for metrics_csv in metrics_csvs:
+                eval_result_dir = metrics_csv.parent / str(metrics_csv.name).replace(
+                    "_metrics.csv", ""
+                ).replace("_metrics.parquet", "")
 
-            if (not metrics_csv.exists()) or overwrite:
-                logging.info("Aggregating for: %s", eval_result_dir)
-                run_aggregator(
-                    eval_result_dir,
-                    num_cpu=num_cpu,
-                )
+                if (not metrics_csv.exists()) or overwrite:
+                    logging.info("Aggregating for: %s", eval_result_dir)
+                    run_aggregator(
+                        eval_result_dir,
+                        num_cpu=num_cpu,
+                    )
 
 
 def _get_a_dataset_result(
-    trial_name_to_metrics_file: dict[str, str],
+    trial_name_to_metrics_file: dict[str, tuple[Path, ...]],
     sub_metrics_df: pd.DataFrame,
     eval_dataset: str,
     model: str,
@@ -212,164 +571,35 @@ def _get_a_dataset_result(
             }
             Only metrics relevant to `eval_dataset` are present.
     """
-    pb_metrics_file = Path(
-        str(trial_name_to_metrics_file[dataset_name]).replace("_metrics.", "_pb_valid.")
+    pb_valid_df = _load_pb_valid_df(trial_name_to_metrics_file, dataset_name)
+
+    working_metrics_df, aux_df, config_key = _prepare_metrics_df(
+        sub_metrics_df, eval_dataset
     )
 
-    if pb_metrics_file.exists():
-        if str(pb_metrics_file).endswith(".parquet"):
-            pb_valid_df = pd.read_parquet(
-                pb_metrics_file,
-                engine="pyarrow",
-            )
-            for col in ["entry_id", "seed", "sample"]:
-                pb_valid_df[col] = pb_valid_df[col].astype("string")
-        else:
-            pb_valid_df = pd.read_csv(
-                pb_metrics_file,
-                dtype={"entry_id": str, "seed": str, "sample": str},
-                low_memory=False,
-            )
-    else:
-        pb_valid_df = None
-
-    # Dataset specific preparation
-    working_metrics_df = sub_metrics_df
-    aux_df = None  # e.g. lowh_df for RecentPDB
-
-    config_key = eval_dataset
-    if eval_dataset == "dsDNA-Protein":
-        config_key = "DNA-Protein"
-
-    if config_key not in DATASET_METRICS_CONFIG:
-        raise NotImplementedError(f"Unknown dataset {eval_dataset}")
-
-    if eval_dataset == "RecentPDB":
-        # Get low homology subset
-        aux_df = pd.read_csv(
-            SUPPORTED_DATA.recentpdb_low_homology,
-            dtype={"entry_id": str, "entity_id_1": str, "entity_id_2": str},
-        )
-        working_metrics_df = sub_metrics_df[
-            get_low_homology_subset(sub_metrics_df, aux_df)
-        ]
-    elif eval_dataset == "AF3-AB":
-        working_metrics_df = get_af3_ab_sub_df(sub_metrics_df)
-    elif eval_dataset == "dsDNA-Protein":
-        dsdna_metrics_df = sub_metrics_df.copy()
-        dsdna_metrics_df = select_df_by_eval_types(dsdna_metrics_df, ["DNA-Protein"])
-
-        dsdna_metrics_df["lddt_mean"] = dsdna_metrics_df.groupby(
-            ["entry_id", "sample", "seed"]
-        )["lddt"].transform("mean")
-
-        dsdna_metrics_df = (
-            dsdna_metrics_df.drop_duplicates(subset=["entry_id", "sample", "seed"])
-            .drop(columns=["lddt"])
-            .rename(columns={"lddt_mean": "lddt"})
-        )
-        working_metrics_df = dsdna_metrics_df
-
-    displayer = ChainInterfaceDisplayer(working_metrics_df, model=model, seeds=seeds)
-    rmsd_displayer = None
-
-    if eval_dataset == "RecentPDB":
-        lowh_entry_ids = set(aux_df["entry_id"])
-        is_lowh_entry = sub_metrics_df["entry_id"].isin(lowh_entry_ids)
-        rmsd_metrics_df = sub_metrics_df[is_lowh_entry]
-    else:
-        rmsd_metrics_df = working_metrics_df
-
-    if ("lig_rmsd" in rmsd_metrics_df.columns) or (
-        "lig_rmsd_wo_refl" in rmsd_metrics_df.columns
-    ):
-        rmsd_displayer = RMSDDisplayer(
-            rmsd_metrics_df,
-            pb_valid_df=pb_valid_df,
-            model=model,
-            seeds=seeds,
-        )
+    (displayers, valid_chain_metrics_df,) = _initialize_displayers(
+        working_metrics_df,
+        sub_metrics_df,
+        aux_df,
+        pb_valid_df,
+        model,
+        seeds,
+        eval_dataset,
+    )
 
     results_lists = defaultdict(list)
     details_lists = defaultdict(list)
 
     for config in DATASET_METRICS_CONFIG[config_key]:
-        mask = None
-        if (
-            config["subset_label"]
-            and eval_dataset == "RecentPDB"
-            and aux_df is not None
-        ):
-            # Support multiple subset_label values separated by semicolons
-            # in the config, e.g. "[antibody-protein];[peptide-interface]".
-            # For each label, build an individual mask and then intersect
-            # them on the metrics DataFrame.
-            subset_labels = [
-                lbl.strip()
-                for lbl in str(config["subset_label"]).split(";")
-                if str(lbl).strip()
-            ]
+        mask, mask_valid = _get_subset_masks(
+            config, eval_dataset, aux_df, working_metrics_df, valid_chain_metrics_df
+        )
 
-            for subset_label in subset_labels:
-                # We need to map subset_label to mask on working_metrics_df
-                # aux_df is lowh_df
-                target_lowh_entries = query_subset_labels(
-                    aux_df["subset"], subset_label
-                )
+        masks = {"mask": mask, "mask_valid": mask_valid}
 
-                # The working_metrics_df is already filtered by lowh_df keys.
-                # We assume get_low_homology_subset matches accurately.
-                # But get_low_homology_subset takes metrics_df and lowh_df.
-                label_mask = get_low_homology_subset(
-                    working_metrics_df, aux_df[target_lowh_entries]
-                )
-
-                if mask is None:
-                    mask = label_mask
-                else:
-                    # Take the intersection across multiple subset_label masks
-                    mask &= label_mask
-
-        # First compute the intersection of all labels, then apply inverse_subset
-        if config["inverse_subset"] and mask is not None:
-            mask = ~mask
-
-        subset_name = config["subset"]
-        eval_types = config["eval_type"]
-        metrics = config["metric"]
-
-        for metric in metrics:
-            if metric == "dockq":
-                res, det = displayer.get_dockq_sr_by_cluster(
-                    mask_on_metrics_df=mask,
-                    eval_types=eval_types,
-                    subset_name=subset_name,
-                )
-                results_lists["dockq"].append(res)
-                details_lists["dockq"].append(det)
-
-            elif metric == "lddt":
-                res, det = displayer.get_lddt_by_cluster(
-                    mask_on_metrics_df=mask,
-                    eval_types=eval_types,
-                    subset_name=subset_name,
-                )
-                if eval_dataset == "dsDNA-Protein":
-                    res["eval_type"] = "dsDNA-Protein"
-                    det["eval_type"] = "dsDNA-Protein"
-                    det["chain_id_1"] = pd.NA
-                    det["chain_id_2"] = pd.NA
-
-                results_lists["lddt"].append(res)
-                details_lists["lddt"].append(det)
-
-            elif metric == "rmsd":
-                if rmsd_displayer:
-                    res, det = rmsd_displayer.get_rmsd()
-                    results_lists["rmsd"].append(res)
-                    details_lists["rmsd"].append(det)
-            else:
-                raise NotImplementedError(f"Unknown metric {metric}")
+        _compute_metric_results(
+            config, displayers, masks, eval_dataset, results_lists, details_lists
+        )
 
     metric_results = {}
     for metric_name in ["dockq", "lddt", "rmsd"]:
@@ -459,7 +689,11 @@ def _save_to_output_csv(
         all_rmsd_df = pd.concat(rmsd_results)
         if len(all_rmsd_df) > 0:
             rmsd_csv = output_dir / "RMSD_results.csv"
-            all_rmsd_df["lig_avg_rmsd"] = all_rmsd_df["lig_avg_rmsd"].astype(float)
+            cols_to_float = ["lig_avg_rmsd", "cdr_h3_bb_avg_rmsd"]
+            for col in cols_to_float:
+                if col in all_rmsd_df.columns:
+                    all_rmsd_df[col] = all_rmsd_df[col].astype(float)
+
             all_rmsd_df = all_rmsd_df.round(4)
             all_rmsd_df.to_csv(
                 rmsd_csv,
@@ -488,23 +722,27 @@ def _integrity_check(
     if seeds_to_check is None:
         seeds_to_check = list(metrics_df["seed"].unique())
 
-    incomplete_entries = set()
+    df_to_check = metrics_df[metrics_df["seed"].isin(seeds_to_check)].copy()
+
+    # Here we assume that a sample will not be missing across all seeds
+    expected_samples = metrics_df["sample"].nunique()
+    expected_count = len(seeds_to_check) * expected_samples
+
+    df_to_check["_seed_sample"] = (
+        df_to_check["seed"].astype(str) + "_" + df_to_check["sample"].astype(str)
+    )
+    counts = df_to_check.groupby("entry_id", observed=True)["_seed_sample"].nunique()
+    incomplete_list = counts[counts < expected_count].index.tolist()
+
     all_set = set(metrics_df["entry_id"])
-    for seed in seeds_to_check:
-        # Here we assume that a sample will not be missing across all seeds
-        for sample in metrics_df["sample"].unique():
-            failed = all_set - set(
-                metrics_df["entry_id"][
-                    (metrics_df["seed"] == seed) & (metrics_df["sample"] == sample)
-                ]
-            )
-            incomplete_entries |= failed
-    return incomplete_entries
+    present_set = set(counts.index)
+    completely_missing = all_set - present_set
+    return set(incomplete_list) | completely_missing
 
 
 def _prepare_tasks(
     eval_info_dict: dict,
-    dataset_to_result_files: dict[str, dict[str, str]],
+    dataset_to_result_files: dict[str, dict[str, tuple[Path, ...]]],
     pdb_id_list: list[str] = None,
     subset_csv: Path = None,
 ) -> list:
@@ -526,72 +764,79 @@ def _prepare_tasks(
         subset_match_key = set()
 
     tasks = []
-    for eval_dataset, dataset_name_to_csv_path in dataset_to_result_files.items():
+    for eval_dataset, dataset_name_to_csv_paths in dataset_to_result_files.items():
         filepath_to_df = {}
         filepath_to_seeds = defaultdict(set)
         filepath_to_dataset_name = defaultdict(list)
-        for dataset_name, metrics_file in dataset_name_to_csv_path.items():
-            filepath_to_dataset_name[metrics_file].append(dataset_name)
+        for dataset_name, metrics_files in dataset_name_to_csv_paths.items():
+            filepath_to_dataset_name[metrics_files].append(dataset_name)
 
-            if metrics_file not in filepath_to_df:
-                if metrics_file.suffix == ".csv":
-                    metrics_df = pd.read_csv(
-                        metrics_file,
-                        dtype={
-                            "entry_id": str,
-                            "entity_id_1": str,
-                            "entity_id_2": str,
-                            "seed": str,
-                            "sample": str,
-                        },
-                        low_memory=False,
-                    )
-                else:
-                    metrics_df = pd.read_parquet(
-                        metrics_file,
-                        engine="pyarrow",
-                    )
-                    for col in [
-                        "entry_id",
-                        "entity_id_1",
-                        "entity_id_2",
-                        "seed",
-                        "sample",
-                    ]:
-                        metrics_df[col] = metrics_df[col].astype("string")
-
-                # Ensure entity_id columns are int strings
-                for col in ("entity_id_1", "entity_id_2"):
-                    if col in metrics_df.columns:
-                        metrics_df[col] = (
-                            pd.to_numeric(metrics_df[col], errors="coerce")
-                            .dropna()
-                            .astype(int)
-                            .astype(str)
-                            .reindex(metrics_df.index)
+            if metrics_files not in filepath_to_df:
+                dfs_to_concat = []
+                for metrics_file in metrics_files:
+                    if metrics_file.suffix == ".csv":
+                        metrics_df = pd.read_csv(
+                            metrics_file,
+                            dtype={
+                                "entry_id": str,
+                                "entity_id_1": str,
+                                "entity_id_2": str,
+                                "seed": str,
+                                "sample": str,
+                                "chain_id_1": str,
+                                "chain_id_2": str,
+                            },
+                            low_memory=False,
                         )
+                    else:
+                        metrics_df = pd.read_parquet(
+                            metrics_file,
+                            engine="pyarrow",
+                        )
+                        for col in [
+                            "entry_id",
+                            "entity_id_1",
+                            "entity_id_2",
+                            "seed",
+                            "sample",
+                        ]:
+                            if col in metrics_df.columns:
+                                metrics_df[col] = metrics_df[col].astype("string")
 
-                metrics_df["match_key"] = list(
-                    zip(
-                        metrics_df["entry_id"].astype(str),
-                        metrics_df["chain_id_1"].astype(str),
-                        metrics_df["chain_id_2"].astype(str),
+                    # Ensure entity_id columns are int strings
+                    for col in ("entity_id_1", "entity_id_2"):
+                        if col in metrics_df.columns:
+                            metrics_df[col] = (
+                                pd.to_numeric(metrics_df[col], errors="coerce")
+                                .dropna()
+                                .astype(int)
+                                .astype(str)
+                                .reindex(metrics_df.index)
+                            )
+
+                    metrics_df["match_key"] = list(
+                        zip(
+                            metrics_df["entry_id"].astype(str),
+                            metrics_df["chain_id_1"].astype(str),
+                            metrics_df["chain_id_2"].astype(str),
+                        )
                     )
-                )
+                    dfs_to_concat.append(metrics_df)
 
-                filepath_to_df[metrics_file] = metrics_df
+                combined_df = pd.concat(dfs_to_concat, ignore_index=True)
+                filepath_to_df[metrics_files] = combined_df
                 logging.info(
                     "%s entries loaded from '%s'\n",
-                    metrics_df["entry_id"].nunique(),
-                    metrics_file,
+                    combined_df["entry_id"].nunique(),
+                    ", ".join([str(p) for p in metrics_files]),
                 )
 
             seeds = eval_info_dict[dataset_name].get("seeds", [])
             if seeds:
-                filepath_to_seeds[metrics_file].update(str(s) for s in seeds)
+                filepath_to_seeds[metrics_files].update(str(s) for s in seeds)
 
         intersection = set(subset_match_key).copy()
-        for metrics_file, metrics_df in list(filepath_to_df.items()):
+        for metrics_files, metrics_df in list(filepath_to_df.items()):
             df = metrics_df
 
             if pdb_id_list is not None:
@@ -599,20 +844,20 @@ def _prepare_tasks(
                 logging.info(
                     '%d entries remain in "%s" after pdb_id_list filter\n',
                     df["entry_id"].nunique(),
-                    ",".join(filepath_to_dataset_name[metrics_file]),
+                    ",".join(filepath_to_dataset_name[metrics_files]),
                 )
                 if df.empty:
                     raise AssertionError(
-                        f"No PDB IDs found in the pdb_id_list for {metrics_file}"
+                        f"No PDB IDs found in the pdb_id_list for {metrics_files}"
                     )
 
             seeds_to_check = None
-            all_seeds = filepath_to_seeds.get(metrics_file, set())
+            all_seeds = filepath_to_seeds.get(metrics_files, set())
             if all_seeds:
                 df = df[df["seed"].isin(all_seeds)].copy()
                 if df.empty:
                     raise ValueError(
-                        f"No matching seeds found in {metrics_file}; "
+                        f"No matching seeds found in {metrics_files}; "
                         f"expected any of {all_seeds}."
                     )
                 seeds_to_check = list(all_seeds)
@@ -623,7 +868,7 @@ def _prepare_tasks(
                     '%d entries are incomplete (N_seed * N_sample) in "%s"; \
                         dropping them before dataset intersection\n',
                     len(incomplete_entries),
-                    ",".join(filepath_to_dataset_name[metrics_file]),
+                    ",".join(filepath_to_dataset_name[metrics_files]),
                 )
                 df = df[~df["entry_id"].isin(incomplete_entries)].copy()
 
@@ -634,12 +879,12 @@ def _prepare_tasks(
                 intersection &= unique_match_key
             assert (
                 intersection
-            ), f'Intersection became empty after processing "{metrics_file}"'
+            ), f'Intersection became empty after processing "{metrics_files}"'
 
-            filepath_to_df[metrics_file] = df
+            filepath_to_df[metrics_files] = df
 
         # Filter DataFrames by intersection
-        for metrics_file, metrics_df in list(filepath_to_df.items()):
+        for metrics_files, metrics_df in list(filepath_to_df.items()):
             sub_metrics_df = metrics_df[
                 metrics_df["match_key"].isin(intersection)
             ].copy()
@@ -673,16 +918,16 @@ def _prepare_tasks(
                         how="left",
                     )
 
-            filepath_to_df[metrics_file] = sub_metrics_df
+            filepath_to_df[metrics_files] = sub_metrics_df
             logging.info(
                 '%s entries in the intersection from "%s"\n',
                 sub_metrics_df["entry_id"].nunique(),
-                ",".join(filepath_to_dataset_name[metrics_file]),
+                ",".join(filepath_to_dataset_name[metrics_files]),
             )
 
-        for dataset_name, metrics_file in dataset_name_to_csv_path.items():
+        for dataset_name, metrics_files in dataset_name_to_csv_paths.items():
             model = eval_info_dict[dataset_name]["model"]
-            sub_metrics_df = filepath_to_df[metrics_file]
+            sub_metrics_df = filepath_to_df[metrics_files]
             dataset_seeds = [
                 str(i)
                 for i in sorted(set(eval_info_dict[dataset_name].get("seeds", [])))
@@ -693,7 +938,7 @@ def _prepare_tasks(
                     sub_metrics_df["seed"].isin(set(dataset_seeds))
                 ].copy()
 
-            remain_seeds = list(sub_metrics_df["seed"].unique())
+            remain_seeds = sorted(list(sub_metrics_df["seed"].unique()), key=int)
             logging.info(
                 '%d entries after filtering from "%s" by %d seeds: [%s]\n',
                 sub_metrics_df["entry_id"].nunique(),
@@ -704,7 +949,7 @@ def _prepare_tasks(
 
             tasks.append(
                 [
-                    dataset_name_to_csv_path,
+                    dataset_name_to_csv_paths,
                     sub_metrics_df,
                     eval_dataset,
                     model,

@@ -14,17 +14,13 @@
 
 import dataclasses
 import json
-import logging
-import tempfile
+import warnings
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import numpy as np
 import pandas as pd
-from biotite.structure.io import pdb
 from ml_collections.config_dict import ConfigDict
-from posebusters import PoseBusters
-from rdkit import Chem
 
 from pxmeter.configs.run_config import RUN_CONFIG
 from pxmeter.constants import IONS, LIGAND
@@ -32,9 +28,10 @@ from pxmeter.data.ccd import get_ccd_mol_from_chain_atom_array
 from pxmeter.data.struct import Structure
 from pxmeter.metrics.dockq import compute_dockq
 from pxmeter.metrics.lddt_metrics import LDDT
+from pxmeter.metrics.pb_valid import run_pb_valid
 from pxmeter.metrics.rmsd_metrics import RMSDMetrics
 
-logging.getLogger("posebusters").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message="The coordinates are missing for some atoms")
 
 
 def compute_pb_valid(
@@ -61,8 +58,6 @@ def compute_pb_valid(
         ref_lig_label_asym_ids = list(ref_lig_label_asym_id)
 
     df_list = []
-    buster = PoseBusters(config="redock")
-
     for lig_label_asym_id in ref_lig_label_asym_ids:
         lig_mask = ref_struct.atom_array.label_asym_id == lig_label_asym_id
 
@@ -75,59 +70,29 @@ def compute_pb_valid(
         model_lig_atom_array.res_name = ref_lig_atom_array.res_name
         model_cond_atom_array = model_struct.atom_array[~lig_mask].copy()
 
-        try:
-            ref_lig_mol = get_ccd_mol_from_chain_atom_array(ref_lig_atom_array)
-            model_lig_mol = get_ccd_mol_from_chain_atom_array(model_lig_atom_array)
-        except Exception:
-            logging.warning(
-                f"Failed to create RDKit molecule for ligand {lig_label_asym_id}. Skipping PoseBusters."
-            )
-            continue
+        ref_lig_mol = get_ccd_mol_from_chain_atom_array(ref_lig_atom_array)
+        model_lig_mol = get_ccd_mol_from_chain_atom_array(model_lig_atom_array)
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_dir = Path(tmp_dir)
-            ref_lig_sdf = tmp_dir / "tmp_ref_lig.sdf"
-            model_lig_sdf = tmp_dir / "tmp_model_lig.sdf"
-            model_cond_pdb = tmp_dir / "tmp_model_cond.pdb"
+        df = run_pb_valid(
+            mol_pred=model_lig_mol,
+            mol_true=ref_lig_mol,
+            mol_cond=model_cond_atom_array,
+        )
 
-            sdf_writer = Chem.SDWriter(str(ref_lig_sdf))
-            sdf_writer.write(ref_lig_mol)
-            sdf_writer.close()
-
-            sdf_writer = Chem.SDWriter(str(model_lig_sdf))
-            sdf_writer.write(model_lig_mol)
-            sdf_writer.close()
-
-            pdb_file = pdb.PDBFile()
-
-            # PDB file only support one letter chain_id, 3 letters res_name, 4 letters atom_name
-            model_cond_atom_array.chain_id = np.array(
-                [i[0] if len(i) > 0 else " " for i in model_cond_atom_array.chain_id],
-                dtype="U1",
-            )
-            model_cond_atom_array.res_name = np.array(
-                [i[:3] for i in model_cond_atom_array.res_name], dtype="U3"
-            )
-            model_cond_atom_array.atom_name = np.array(
-                [i[:4] for i in model_cond_atom_array.atom_name], dtype="U4"
-            )
-            model_cond_atom_array.bonds = None
-
-            pdb_file.set_structure(model_cond_atom_array)
-            pdb_file.write(model_cond_pdb)
-
-            df = buster.bust(
-                mol_pred=model_lig_sdf,
-                mol_true=ref_lig_sdf,
-                mol_cond=model_cond_pdb,
-                full_report=True,
-            )
-            # record ligand chain id
-            df["ref_lig_chain_id"] = ref_lig_chain_id
-            df["model_lig_chain_id"] = model_lig_chain_id
+        # record ligand chain id
+        df["ref_lig_chain_id"] = ref_lig_chain_id
+        df["model_lig_chain_id"] = model_lig_chain_id
+        if not df.empty:
             df_list.append(df)
+    if not df_list:
+        return pd.DataFrame()
 
-    df_cat = pd.concat(df_list)
+    # Avoid FutureWarning in pandas 2.1+ by excluding all-NA columns from entries
+    # and ensuring we only concat non-empty DataFrames.
+    df_list = [d.dropna(axis=1, how="all") for d in df_list if not d.empty]
+    if not df_list:
+        return pd.DataFrame()
+    df_cat = pd.concat(df_list, ignore_index=True)
     return df_cat
 
 
@@ -689,6 +654,22 @@ class MetricResult:
                     interface_bb_lddt_dict, interface_result_dict
                 )
 
+            # Calculate LDDT-PLI
+            if interested_lig_label_asym_id and metric_config.lddt.calc_lddt_pli:
+                lig_chain_to_calc = interested_lig_label_asym_id
+                if isinstance(interested_lig_label_asym_id, str):
+                    lig_chain_to_calc = [interested_lig_label_asym_id]
+
+                for lig_chain_id in lig_chain_to_calc:
+                    lddt_pli = calc_lddt.lddt_calculator.calc_lddt_pli(
+                        ref_lig_label_asym_id=lig_chain_id,
+                        inclusion_radius=6.0,
+                    )
+                    if not np.isnan(lddt_pli):
+                        if lig_chain_id not in chain_result_dict:
+                            chain_result_dict[lig_chain_id] = {}
+                        chain_result_dict[lig_chain_id]["lddt_pli"] = lddt_pli
+
         # Calculate DockQ
         if metric_config.calc_dockq:
             dockq_result_dict = compute_dockq(
@@ -710,6 +691,20 @@ class MetricResult:
             chain_pb_valid_dict = cls._post_process_pb_valid(pb_valid_result_df)
         else:
             chain_pb_valid_dict = None
+
+        # Calculate CDR-H3 RMSD
+        if metric_config.calc_cdr_h3_bb_rmsd:
+            from pxmeter.metrics.antibody.cdr_h3_rmsd import calc_cdr_h3_bb_rmsd
+
+            cdr_h3_rmsd_result = calc_cdr_h3_bb_rmsd(
+                ref_struct=ref_struct,
+                model_struct=model_struct,
+            )
+            # update chain_result_dict
+            for chain_id, rmsd_val in cdr_h3_rmsd_result.items():
+                if chain_id not in chain_result_dict:
+                    chain_result_dict[chain_id] = {}
+                chain_result_dict[chain_id]["cdr_h3_bb_rmsd"] = rmsd_val
 
         return cls(
             ref_struct=ref_struct,

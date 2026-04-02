@@ -381,6 +381,7 @@ The aggregation script internally executes two major stages:
 
     * Uses both DockQ (for protein-protein interfaces) and LDDT (for intra-chain and interface-level evaluation).
     * Computes ligand and pocket RMSD for protein–ligand chains when the underlying metrics table contains `lig_rmsd` / `pocket_rmsd`, and aggregates them over low-homology pocket clusters in the same two-stage way as other metrics.
+    * Computes CDR-H3 backbone RMSD for antibody heavy chains when the underlying metrics table contains `cdr_h3_bb_rmsd`. Unlike other metrics, this is averaged directly over all chains without clustering.
     * Subsets by antibody vs non-antibody, monomer, peptide, cyclic peptide, etc., using the subset labels in the metadata CSV.
 
   * **AF3-AB**
@@ -488,13 +489,16 @@ The aggregation code distinguishes between **summary metrics** (one row per data
 * **LDDT-based metrics** (chain-level intra metrics and interface metrics):
 
   * For `Intra-*` eval types, LDDT is computed per **chain**; for other eval types it is computed per **interface**.
+  * `LDDT-PLI` is computed for ligands, measuring the local distance agreement of the ligand and its binding pocket.
   * For each cluster, LDDT values are averaged across all entries in the cluster.
   * The summary column `lddt` stores the mean of these per-cluster averages; `ci_lddt` stores a bootstrap confidence interval.
+  * **Note**: LDDT-PLI scores are aggregated per chain (entry_id + chain_id), not averaged by cluster_id.
 
 * **RMSD-based metrics** (ligand quality)
 
   * `lig_avg_rmsd`: mean ligand pocket-aligned RMSD across all ligand chains.
   * `lig_rmsd_sr`: success rate under the ligand RMSD threshold (2.0 Å by default).
+  * `Ligand SR`: success rate where Ligand RMSD < 2.0 Å AND LDDT-PLI > 0.8.
   * PoseBusters validity checks (e.g., steric-clash violations, tetrahedral-chirality correctness) are included as additional columns; when present, they are also used to construct penalized rankers that downweight chemically invalid poses.
   * `pb_all_valid_sr`: success rate of passing all PoseBusters checks.
   * `pb_all_valid_and_good_rmsd_sr`: success rate of simultaneously passing all PoseBusters checks **and** the ligand RMSD threshold (2.0 Å by default).
@@ -506,6 +510,15 @@ The aggregation code distinguishes between **summary metrics** (one row per data
   * any Custom dataset that provides a `lig_rmsd` column in its per-sample metrics table.
 
   **Note**: When using the `RecentPDB` dataset, all the metrics above are computed in a two-stage manner: a within-cluster average over pocket-chain `cluster_id`, followed by an across-cluster average.
+
+* **Framework-aligned CDR-H3 loop backbone RMSD metrics** (antibody CDR-H3 quality)
+
+  * `cdr_h3_bb_avg_rmsd`: mean CDR-H3 backbone RMSD across all antibody heavy chains.
+  * `cdr_h3_bb_rmsd_sr`: success rate under the CDR-H3 RMSD threshold (1.0 Å by default).
+
+  **Note**: Unlike other metrics in RecentPDB, this metric is aggregated by `{entry_id}_{entity_id_1}` instead of sequence clusters. The averages and success rates are computed first within each `{entry_id}_{entity_id_1}` group, and then averaged across all groups.
+
+  This metric is computed when `calc_cdr_h3_bb_rmsd` is enabled in the configuration.
 
 
 For each metric type, multiple **rankers** are reported:

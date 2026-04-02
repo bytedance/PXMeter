@@ -315,24 +315,39 @@ RMSD around ligands when `interested_lig_label_asym_id` is provided.
 
 **Default:** `True`
 
-Enables computation of **PoseBusters validity** for selected ligands,
+Enables computation of **PoseBusters-like validity metrics** for selected ligands,
 provided that:
 
 - `metric.calc_pb_valid` is `True` *and*
 - `interested_lig_label_asym_id` is set when calling `evaluate()`.
 
-- When enabled, PXMeter invokes PoseBusters in redocking mode:
+- When enabled, PXMeter invokes internal validity checks:
   - builds RDKit molecules for the reference and model ligands;
-  - constructs the model environment as a PDB file;
-  - runs PoseBusters checks and records the per-ligand report.
-- When disabled, PoseBusters is not run even if ligand IDs are provided.
+  - extracts the model environment;
+  - runs chemical, geometric, and physical checks and records the per-ligand report.
+- When disabled, these checks are not run even if ligand IDs are provided.
 
 Typical reasons to disable:
 
-- PoseBusters is not installed, or external dependencies are
-  unavailable.
 - You are only interested in geometric metrics (LDDT, RMSD, DockQ,
   clashes) and want to reduce runtime.
+
+#### 3.1.6 `metric.calc_cdr_h3_bb_rmsd` (bool)
+
+**Default:** `False`
+
+Enables computation of **CDR-H3 backbone RMSD** for antibody heavy chains.
+
+- When `True`, PXMeter:
+  - annotates protein sequences using ANARCII to identify antibody heavy chains and their CDR-H3 loops;
+  - aligns the model heavy chain to the reference using backbone atoms of framework regions (FR1-4);
+  - computes the RMSD of backbone atoms in the CDR-H3 loop.
+- When `False`, this metric is skipped.
+
+Typical use cases:
+
+- Enable this when benchmarking antibody structure prediction models.
+- Keep disabled for general protein complexes to save runtime (avoids ANARCII annotation overhead).
 
 ---
 

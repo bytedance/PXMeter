@@ -11,6 +11,7 @@ Refer to [datapipeline_output.md](datapipeline_output.md) for detailed file desc
   - [PXM-2025 dataset (2025-01-01 to 2025-12-31)](#pxm-2025-dataset-2025-01-01-to-2025-12-31)
   - [PXM-2024 dataset (2024-01-01 to 2024-12-31)](#pxm-2024-dataset-2024-01-01-to-2024-12-31)
 - [Supplementary Evaluation Sets](#supplementary-evaluation-sets)
+  - [PXM-24to25 dataset (2024-01-01 to 2025-12-31)](#pxm-24to25-dataset-2024-01-01-to-2025-12-31)
   - [PXM-22to25 dataset (2022-01-01 to 2025-12-31)](#pxm-22to25-dataset-2022-01-01-to-2025-12-31)
   - [PXM-2025-H2 dataset (2025-07-01 to 2025-12-31)](#pxm-2025-h2-dataset-2025-07-01-to-2025-12-31)
   - [PXM-Legacy dataset (Initial PXMeter Release Dataset)](#pxm-legacy-dataset-initial-pxmeter-release-dataset)
@@ -91,6 +92,56 @@ Refer to [datapipeline_output.md](datapipeline_output.md) for detailed file desc
 
 ## Supplementary Evaluation Sets
 
+### **PXM-24to25 dataset (2024-01-01 to 2025-12-31)**
+
+`supported_data` (2.39 GB): https://pxmeter.tos-cn-beijing.volces.com/PXM-24to25-sup-only.tar.gz
+
+`src_data` + `supported_data` (4.28 GB): https://pxmeter.tos-cn-beijing.volces.com/PXM-24to25.tar.gz
+
+```
+<DATA FILTERING PIPELINE STATISTICS>
+# Total: 246905
+# FilteredByDate: 32881 (-214024)
+# ExcludeNMR: 32356 (-525)
+# FilteredByResolution: 31627 (-729)
+# FilteredByTokenCount: 25320 (-6307)
+# RequireStandardPolymer: 25318 (-2)
+# LimitPolymerChainCopies: 25284 (-34)
+# ExcludeAllChainsUnknown: 25284 (0)
+# RequireResolvedStructure: 25239 (-45)
+
+
+<LOW-HOMOLOGY SUBSET STATISTICS>
+# Complex: 4691
+# Chain: 7356
+# Interface: 11095
+------------------
+# Intra-Protein: 6089 (# PDB: 3115, # Cluster: 1706)
+# Intra-RNA: 456 (# PDB: 367, # Cluster: 167)
+# Intra-DNA: 544 (# PDB: 306, # Cluster: 242)
+# Intra-Ligand: 267 (# PDB: 267, # Cluster: 260)
+# Protein-Protein: 7647 (# PDB: 2780, # Cluster: 2130)
+# DNA-DNA: 322 (# PDB: 241, # Cluster: 176)
+# RNA-RNA: 116 (# PDB: 98, # Cluster: 53)
+# Protein-Ligand: 387 (# PDB: 351, # Cluster: 145)
+# RNA-Protein: 804 (# PDB: 351, # Cluster: 256)
+# DNA-Protein: 1645 (# PDB: 438, # Cluster: 531)
+# DNA-RNA: 171 (# PDB: 134, # Cluster: 97)
+# DNA-Ligand: 2 (# PDB: 2, # Cluster: 1)
+# RNA-Ligand: 1 (# PDB: 1, # Cluster: 1)
+------------------
+# [protein_homomer]: 2570 (# PDB: 354, # Cluster: 541)
+# [protein_monomer]: 951 (# PDB: 951, # Cluster: 534)
+# [antibody-protein]: 583 (# PDB: 244, # Cluster: 179)
+# [antibody_HL-protein]: 340 (# PDB: 126, # Cluster: 120)
+# [antibody_H-protein]: 236 (# PDB: 111, # Cluster: 57)
+# [peptide-interface]: 136 (# PDB: 41, # Cluster: 40)
+# [peptide-protein]: 136 (# PDB: 41, # Cluster: 40)
+# [rna_monomer]: 77 (# PDB: 77, # Cluster: 28)
+# [antibody_scFv-protein]: 7 (# PDB: 7, # Cluster: 2)
+# [cyclic_peptide-interface]: 4 (# PDB: 3, # Cluster: 3)
+# [cyclic_peptide-protein]: 4 (# PDB: 3, # Cluster: 3)
+```
 
 ### **PXM-22to25 dataset (2022-01-01 to 2025-12-31)**
 

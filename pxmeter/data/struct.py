@@ -145,6 +145,27 @@ class Structure:
             cif_block=cif_block,
         )
 
+    def get_release_date(self) -> str:
+        """
+        Get first release date.
+
+        Returns:
+            str: yyyy-mm-dd
+        """
+        assert self.cif_block is not None, "cif_block is None."
+        return MMCIFParser.get_release_date(self.cif_block)
+
+    def get_resolution(self) -> float:
+        """
+        Get resolution for X-ray and cryoEM.
+        Some methods don't have resolution, set as -1.0.
+
+        Returns:
+            float: resolution (set to -1.0 if not found).
+        """
+        assert self.cif_block is not None, "cif_block is None."
+        return MMCIFParser.get_resolution(self.cif_block)
+
     def _get_hydrogens_mask(self) -> np.ndarray:
         """
         Get mask of hydrogens.

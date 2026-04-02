@@ -47,63 +47,6 @@ from benchmark.utils import add_comp_chain_iface_id
 NMR_METHODS = {"SOLID-STATE NMR", "SOLUTION NMR"}
 
 
-def get_release_date(cif_block: dict) -> str:
-    """
-    Get first release date.
-
-    Args:
-        cif_block (dict): mmcif_io.MMCIFParser dictionary
-
-    Returns:
-        str: yyyy-mm-dd
-    """
-
-    if "pdbx_audit_revision_history" in cif_block:
-        history = cif_block["pdbx_audit_revision_history"]
-        # np.str_ is inherit from str, so return is str
-        date = history["revision_date"].as_array()[0]
-    else:
-        # no release date
-        date = "9999-12-31"
-
-    valid_date = is_valid_date_format(date)
-    assert valid_date, f"Invalid date format: {date}, it should be yyyy-mm-dd format"
-    return date
-
-
-def get_resolution(cif_block: dict) -> float:
-    """
-    Get resolution for X-ray and cryoEM.
-    Some methods don't have resolution, set as -1.0
-
-    Args:
-        cif_block (dict): mmcif_io.MMCIFParser dictionary
-
-    Returns:
-        float: resolution (set to -1.0 if not found)
-    """
-    resolution_names = [
-        "refine.ls_d_res_high",
-        "em_3d_reconstruction.resolution",
-        "reflns.d_resolution_high",
-    ]
-    for category_item in resolution_names:
-        category, item = category_item.split(".")
-        if category in cif_block and item in cif_block[category]:
-            try:
-                resolution = cif_block[category][item].as_array(float)[0]
-                # "." will be converted to 0.0, but it is not a valid resolution.
-                if resolution == 0.0:
-                    continue
-                return resolution
-            except ValueError:
-                # in some cases, resolution_str is "?"
-                continue
-        else:
-            continue
-    return -1.0
-
-
 def _get_nonpoly_seq(cif_parser: MMCIFParser) -> list[dict[str, str]]:
     nonpoly_scheme_df = cif_parser.get_category_table("pdbx_nonpoly_scheme")
 
@@ -562,13 +505,13 @@ def get_chain_and_interface_from_cif(
     }
     chain_interface_info_list = []  # list[dict]
 
-    release_date = get_release_date(cif_parser.cif.block)
+    release_date = MMCIFParser.get_release_date(cif_parser.cif.block)
     meta_info["release_date"] = release_date
 
     exptl_methods = tuple(cif_parser.exptl_methods)
     meta_info["exptl_methods"] = ";".join(list(cif_parser.exptl_methods))
 
-    resolution = get_resolution(cif_parser.cif.block)
+    resolution = MMCIFParser.get_resolution(cif_parser.cif.block)
     meta_info["resolution"] = resolution
 
     meta_info["classification"] = cif_parser.cif.block["struct_keywords"][

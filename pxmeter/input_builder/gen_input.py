@@ -15,6 +15,7 @@
 import argparse
 import logging
 import random
+import re
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -26,8 +27,9 @@ from pxmeter.input_builder.constants import VALID_INPUT_TYPES, VALID_OUTPUT_TYPE
 from pxmeter.input_builder.interactive import run_interactive_gen
 from pxmeter.input_builder.model_inputs.alphafold3 import AlpahFold3Input
 from pxmeter.input_builder.model_inputs.boltz import BoltzInput
+from pxmeter.input_builder.model_inputs.openfold3 import OpenFold3Input
 from pxmeter.input_builder.model_inputs.protenix import ProtenixInput
-from pxmeter.input_builder.seq import Sequences
+from pxmeter.input_builder.seq import Sequences, SequencesFilter
 from pxmeter.utils import str_to_none
 
 
@@ -38,6 +40,9 @@ def gen_one(
     output_type: str,
     seeds: list[int],
     assembly_id: Optional[str] = None,
+    keep_polymer_crosslinks: bool = False,
+    remove_entity_types: Optional[list[str]] = None,
+    use_ori_chain_id: bool = True,
 ):
     """
     Generate a single model-input file from one source file.
@@ -50,27 +55,78 @@ def gen_one(
         seeds (list[int]): List of model seeds to encode in the output.
             Required for AF3, optional or unused for other formats.
         assembly_id (str | None, optional): Assembly ID for CIF input. Defaults to None.
+        keep_polymer_crosslinks (bool, optional): If True, keep polymer-polymer
+            crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list. Defaults to False.
+        remove_entity_types (list[str] | None, optional): List of entity types to remove.
+            Choices: "ligand", "ion", "glycan", "protein", "dna", "rna", "covalent_ligand".
+        use_ori_chain_id (bool, optional): If True, use original chain ID from the input file.
+            Defaults to True.
     """
     output_f.parent.mkdir(parents=True, exist_ok=True)
     if input_type == "cif":
-        seqs = Sequences.from_mmcif(input_f, assembly_id=assembly_id)
+        seqs_list = [
+            Sequences.from_mmcif(
+                input_f,
+                assembly_id=assembly_id,
+                keep_polymer_crosslinks=keep_polymer_crosslinks,
+            )
+        ]
     elif input_type == "af3":
-        seqs = AlpahFold3Input.from_json_file(input_f).to_sequences()
+        seqs_list = [AlpahFold3Input.from_json_file(input_f).to_sequences()]
     elif input_type == "protenix":
-        seqs = ProtenixInput.from_json_file(input_f).to_sequences()
+        seqs_list = [
+            inp.to_sequences() for inp in ProtenixInput.from_json_file_multi(input_f)
+        ]
     elif input_type == "boltz":
-        seqs = BoltzInput.from_yaml_file(input_f).to_sequences()
+        seqs_list = [BoltzInput.from_yaml_file(input_f).to_sequences()]
+    elif input_type == "openfold3":
+        seqs_list = [
+            inp.to_sequences() for inp in OpenFold3Input.from_json_file_multi(input_f)
+        ]
     else:
         raise ValueError(f"Unsupported input type: {input_type}")
 
-    if output_type == "af3":
-        AlpahFold3Input.from_sequences(seqs, seeds).to_json_file(output_f)
-    elif output_type == "protenix":
-        ProtenixInput.from_sequences(seqs, seeds).to_json_file(output_f)
-    elif output_type == "boltz":
-        BoltzInput.from_sequences(seqs).to_yaml_file(output_f)
-    else:
-        raise ValueError(f"Unsupported output type: {output_type}")
+    for i, seqs in enumerate(seqs_list):
+        if not use_ori_chain_id:
+            for seq in seqs.sequences:
+                seq.ori_chain_id = None
+
+        if remove_entity_types:
+            for rm_type in remove_entity_types:
+                seq_filter = SequencesFilter(seqs)
+                remove_method_map = {
+                    "ligand": seq_filter.remove_ligand,
+                    "ion": seq_filter.remove_ion,
+                    "glycan": seq_filter.remove_glycan,
+                    "protein": seq_filter.remove_protein,
+                    "dna": seq_filter.remove_dna,
+                    "rna": seq_filter.remove_rna,
+                    "covalent_ligand": seq_filter.remove_covalent_ligand,
+                }
+                if rm_type in remove_method_map:
+                    seqs = remove_method_map[rm_type]()
+                else:
+                    logging.warning(f"Unknown entity type to remove: {rm_type}")
+
+        if len(seqs_list) > 1:
+            name_suffix = seqs.name if seqs.name else f"query_{i}"
+            name_suffix = re.sub(r"[^a-zA-Z0-9_\-]", "_", name_suffix)
+            curr_output_f = output_f.with_name(
+                f"{output_f.stem}_{name_suffix}{output_f.suffix}"
+            )
+        else:
+            curr_output_f = output_f
+
+        if output_type == "af3":
+            AlpahFold3Input.from_sequences(seqs, seeds).to_json_file(curr_output_f)
+        elif output_type == "protenix":
+            ProtenixInput.from_sequences(seqs, seeds).to_json_file(curr_output_f)
+        elif output_type == "boltz":
+            BoltzInput.from_sequences(seqs).to_yaml_file(curr_output_f)
+        elif output_type == "openfold3":
+            OpenFold3Input.from_sequences(seqs).to_json_file(curr_output_f)
+        else:
+            raise ValueError(f"Unsupported output type: {output_type}")
 
 
 def gen_batch(
@@ -80,6 +136,9 @@ def gen_batch(
     seeds: list[int],
     assembly_id: Optional[str] = None,
     num_cpu: int = -1,
+    keep_polymer_crosslinks: bool = False,
+    remove_entity_types: Optional[list[str]] = None,
+    use_ori_chain_id: bool = True,
 ):
     """
     Generate model-input files for a batch of inputs in parallel.
@@ -94,11 +153,36 @@ def gen_batch(
         assembly_id (str | None, optional): Assembly ID for CIF input. Defaults to None.
         num_cpu (int, optional): Number of worker processes for parallelism.
             Defaults to -1 (all available cores).
+        keep_polymer_crosslinks (bool, optional): If True, keep polymer-polymer
+            crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list. Defaults to False.
+        remove_entity_types (list[str] | None, optional): List of entity types to remove.
+        use_ori_chain_id (bool, optional): If True, use original chain ID from the input file.
+            Defaults to True.
     """
 
-    def try_gen_one(inp, out, input_type, output_type, seeds, assembly_id):
+    def try_gen_one(
+        inp,
+        out,
+        input_type,
+        output_type,
+        seeds,
+        assembly_id,
+        keep_polymer_crosslinks,
+        remove_entity_types,
+        use_ori_chain_id,
+    ):
         try:
-            gen_one(inp, out, input_type, output_type, seeds, assembly_id)
+            gen_one(
+                inp,
+                out,
+                input_type,
+                output_type,
+                seeds,
+                assembly_id,
+                keep_polymer_crosslinks,
+                remove_entity_types,
+                use_ori_chain_id,
+            )
             return 1
         except Exception as e:
             logging.error(
@@ -119,7 +203,15 @@ def gen_batch(
         for r in tqdm(
             Parallel(n_jobs=num_cpu, return_as="generator_unordered")(
                 delayed(try_gen_one)(
-                    inp, out, input_type, output_type, seeds, assembly_id
+                    inp,
+                    out,
+                    input_type,
+                    output_type,
+                    seeds,
+                    assembly_id,
+                    keep_polymer_crosslinks,
+                    remove_entity_types,
+                    use_ori_chain_id,
                 )
                 for inp, out in input_and_output_files
             ),
@@ -150,6 +242,9 @@ def run_gen_input(
     assembly_id: Optional[str] = None,
     num_cpu: int = -1,
     pdb_ids: Optional[str] = None,
+    keep_polymer_crosslinks: bool = False,
+    remove_entity_types: Optional[list[str]] = None,
+    use_ori_chain_id: bool = True,
 ):
     """
     Entry point for generating model inputs from files or directories.
@@ -163,7 +258,7 @@ def run_gen_input(
         output_path (Path): Output file or directory path.
         input_type (str): Input type ("cif", "af3", or "protenix").
         output_type (str): Output type ("af3" or "protenix").
-        seeds (list[int], optional): Explicit list of seeds. For AF3 output, 
+        seeds (list[int], optional): Explicit list of seeds. For AF3 output,
             exactly one of `seeds` or `num_seeds` must be provided.
         num_seeds (int, optional): Number of seeds to generate as 0..num_seeds-1.
             Required for AF3 if `seeds` is not provided.
@@ -176,6 +271,11 @@ def run_gen_input(
             After parsing, the PDB IDs are passed here as a list of
             strings and are used to restrict which input/output files are
             generated when ``input_path`` is a directory.
+        keep_polymer_crosslinks (bool, optional): If True, keep polymer-polymer
+            crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list. Defaults to False.
+        remove_entity_types (list[str] | None, optional): List of entity types to remove.
+        use_ori_chain_id (bool, optional): If True, use original chain ID from the input file.
+            Defaults to True.
     """
     pdb_ids_lst = []
     if pdb_ids:
@@ -220,15 +320,15 @@ def run_gen_input(
         # Select file suffixes
         if input_type == "cif":
             input_suffixes = ".cif"
-        elif input_type in ["af3", "protenix"]:
-            # protenix / af3
+        elif input_type in ["af3", "protenix", "openfold3"]:
+            # protenix / af3 / openfold3
             input_suffixes = ".json"
         elif input_type == "boltz":
             input_suffixes = ".yaml"
         else:
             raise ValueError(f"Unsupported input type: {input_type}")
 
-        if output_type in ["af3", "protenix"]:
+        if output_type in ["af3", "protenix", "openfold3"]:
             output_suffixes = ".json"
         elif output_type == "boltz":
             output_suffixes = ".yaml"
@@ -266,14 +366,27 @@ def run_gen_input(
             seeds,
             assembly_id,
             num_cpu,
+            keep_polymer_crosslinks,
+            remove_entity_types,
+            use_ori_chain_id,
         )
 
     else:
-        gen_one(input_path, output_path, input_type, output_type, seeds, assembly_id)
+        gen_one(
+            input_path,
+            output_path,
+            input_type,
+            output_type,
+            seeds,
+            assembly_id,
+            keep_polymer_crosslinks,
+            remove_entity_types,
+            use_ori_chain_id,
+        )
         logging.info("Generated %s from %s", output_path, input_path)
 
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Generate model inputs")
     parser.add_argument(
         "-i", "--input", type=Path, required=False, help="Input file or directory"
@@ -321,8 +434,7 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help=(
-            "Number of seeds; required if --seeds is not provided "
-            "and -ot is 'af3'."
+            "Number of seeds; required if --seeds is not provided " "and -ot is 'af3'."
         ),
     )
     parser.add_argument(
@@ -351,6 +463,29 @@ if __name__ == "__main__":
             "processed."
         ),
     )
+    parser.add_argument(
+        "--keep_polymer_crosslinks",
+        action="store_true",
+        help="Keep polymer-polymer crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list.",
+    )
+    parser.add_argument(
+        "-rm",
+        "--remove-entity-types",
+        dest="remove_entity_types",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of entity types to remove from the input. "
+            "Choices: ligand, ion, glycan, protein, dna, rna, covalent_ligand."
+        ),
+    )
+    parser.add_argument(
+        "--reassign-chain-id",
+        dest="use_ori_chain_id",
+        action="store_false",
+        help="Reassign chain IDs, ignoring original ones from the input file.",
+    )
+    parser.set_defaults(use_ori_chain_id=True)
     args = parser.parse_args()
 
     if args.interactive:
@@ -368,6 +503,12 @@ if __name__ == "__main__":
     else:
         seeds_lst = args.seeds
 
+    remove_entity_types = None
+    if args.remove_entity_types:
+        remove_entity_types = [
+            x.strip().lower() for x in args.remove_entity_types.split(",") if x.strip()
+        ]
+
     run_gen_input(
         input_path=args.input,
         output_path=args.output,
@@ -378,4 +519,11 @@ if __name__ == "__main__":
         assembly_id=args.assembly_id,
         num_cpu=args.num_cpu,
         pdb_ids=args.pdb_ids,
+        keep_polymer_crosslinks=args.keep_polymer_crosslinks,
+        remove_entity_types=remove_entity_types,
+        use_ori_chain_id=args.use_ori_chain_id,
     )
+
+
+if __name__ == "__main__":
+    main()

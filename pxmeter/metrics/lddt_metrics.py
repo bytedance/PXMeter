@@ -17,7 +17,7 @@ from typing import Optional, Sequence, Union
 import numpy as np
 from scipy.spatial import KDTree
 
-from pxmeter.constants import DNA, RNA
+from pxmeter.constants import DNA, DNA_RNA_HYBRID, POLYMER, PROTEIN_D, RNA
 from pxmeter.data.struct import Structure
 from pxmeter.metrics.stereochemistry.check import StereoChemValidator
 
@@ -62,6 +62,7 @@ class LDDT:
         )
 
         self.lddt_atom_pair = self.compute_lddt_atom_pair()
+
         model_dist_all, ref_dist_all = self._calc_sparse_dist(
             self.lddt_atom_pair[:, 0], self.lddt_atom_pair[:, 1]
         )
@@ -234,6 +235,88 @@ class LDDT:
         m_index = self.lddt_atom_pair[pair_indices, 1]
         pair_subset = atom_mask[l_index] & atom_mask[m_index]
         return pair_indices[pair_subset]
+
+    def calc_lddt_pli(
+        self,
+        ref_lig_label_asym_id: Union[str, list[str]],
+        inclusion_radius: float = 6.0,
+    ) -> float:
+        """
+        Calculate LDDT-PLI score.
+
+        Args:
+            ref_lig_label_asym_id (str|list[str]): Ligand chain ID(s).
+            inclusion_radius (float): Radius to define binding site residues and
+                                      include atom pairs for LDDT calculation.
+
+        Returns:
+            float: LDDT-PLI score.
+        """
+        if isinstance(ref_lig_label_asym_id, str):
+            ref_lig_label_asym_id = [ref_lig_label_asym_id]
+
+        ref_struct = self.ref_struct
+
+        # Identify Ligand Atoms
+        ligand_mask = np.isin(ref_struct.uni_chain_id, ref_lig_label_asym_id)
+        if not np.any(ligand_mask):
+            return float("nan")
+
+        # Identify Pocket Residues
+        ligand_coords = ref_struct.atom_array.coord[ligand_mask]
+        kdtree = KDTree(ref_struct.atom_array.coord)
+
+        nearby_indices = np.unique(
+            np.concatenate(kdtree.query_ball_point(ligand_coords, r=inclusion_radius))
+        )
+
+        is_polymer = ref_struct.get_mask_for_given_entity_types(
+            POLYMER + [PROTEIN_D, DNA_RNA_HYBRID]
+        )
+        pocket_atom_indices = nearby_indices[is_polymer[nearby_indices]]
+
+        if pocket_atom_indices.size == 0:
+            return float("nan")
+
+        starts = ref_struct.get_residue_starts(add_exclusive_stop=True)
+        pocket_res_indices = np.unique(
+            np.searchsorted(starts, pocket_atom_indices, side="right") - 1
+        )
+
+        pocket_mask = np.zeros(len(ref_struct.atom_array), dtype=bool)
+        for res_idx in pocket_res_indices:
+            s = starts[res_idx]
+            e = starts[res_idx + 1]
+            pocket_mask[s:e] = True
+
+        pocket_mask = pocket_mask & (~ligand_mask)
+
+        if not np.any(pocket_mask):
+            return float("nan")
+
+        # Filter pairs for LDDT-PLI
+        pair_indices = self._get_lddt_atom_pair_indices_for_chain_mask(
+            ligand_mask, pocket_mask
+        )
+
+        if pair_indices.size == 0:
+            return float("nan")
+
+        # Apply distance filter (inclusion_radius)
+        l_idx = self.lddt_atom_pair[pair_indices, 0]
+        m_idx = self.lddt_atom_pair[pair_indices, 1]
+
+        ref_coords_l = ref_struct.atom_array.coord[l_idx]
+        ref_coords_m = ref_struct.atom_array.coord[m_idx]
+        ref_dists = np.linalg.norm(ref_coords_l - ref_coords_m, axis=-1)
+
+        dist_mask = ref_dists < inclusion_radius
+        final_indices = pair_indices[dist_mask]
+
+        if final_indices.size == 0:
+            return float("nan")
+
+        return self._calc_lddt(final_indices)
 
     def run(
         self,

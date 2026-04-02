@@ -81,6 +81,11 @@ class ProtenixEntity:
                 "sequence": self.sequence.sequence,
                 "count": self.count,
             }
+            if self.ori_chain_ids and all(
+                isinstance(x, str) for x in self.ori_chain_ids
+            ):
+                entity_dict["id"] = list(self.ori_chain_ids)
+
             if self.sequence.entity_type in [PROTEIN, PROTEIN_D]:
                 # # U -> SEC -> CYS -> C
                 entity_dict["sequence"] = entity_dict["sequence"].replace("U", "C")
@@ -225,22 +230,47 @@ class ProtenixInput:
         seqs_to_entities = {}
         chain_to_entity_and_copy = {}
 
+        # Determine unique chain ID for each sequence
+        # Prioritize ori_chain_id, generate unique ID if missing.
+        existing_chain_ids = {
+            seq.ori_chain_id for seq in sequences.sequences if seq.ori_chain_id
+        }
+
+        seq_idx_to_chain_id = {}
+        next_chain_id_int = 1
+
+        for seq_idx, seq in enumerate(sequences.sequences):
+            if seq.ori_chain_id:
+                chain_id = seq.ori_chain_id
+            else:
+                # Generate a unique chain ID
+                while True:
+                    candidate = int_to_letters(next_chain_id_int)
+                    next_chain_id_int += 1
+                    if candidate not in existing_chain_ids:
+                        chain_id = candidate
+                        existing_chain_ids.add(chain_id)
+                        break
+            seq_idx_to_chain_id[seq_idx] = chain_id
+
         entity_id = 0
         for seq_idx, seq in enumerate(sequences.sequences):
+            chain_id = seq_idx_to_chain_id[seq_idx]
+
             if seq not in seqs_to_entities:
                 entity_id += 1
                 seqs_to_entities[seq] = ProtenixEntity(
                     entity_id=entity_id,
                     sequence=seq,
                     count=1,
-                    ori_chain_ids=(seq_idx,),
+                    ori_chain_ids=(chain_id,),
                 )
                 # copy 1
                 chain_to_entity_and_copy[seq_idx] = (entity_id, 1)
 
             else:
                 seqs_to_entities[seq].count += 1
-                seqs_to_entities[seq].add_ori_chain_id(seq_idx)
+                seqs_to_entities[seq].add_ori_chain_id(chain_id)
                 copy_id = len(seqs_to_entities[seq].ori_chain_ids)
                 chain_to_entity_and_copy[seq_idx] = (entity_id, copy_id)
 
@@ -296,8 +326,17 @@ class ProtenixInput:
 
             for json_entity_type, entity_dict in seq_dict.items():
                 entity_type = entity_type_mapping[json_entity_type]
-
                 count = entity_dict["count"]
+
+                # Determine chain IDs (from 'id' field or auto-generated)
+                json_ids = entity_dict.get("id")
+                if json_ids and len(json_ids) == count:
+                    ori_chain_ids = tuple(json_ids)
+                else:
+                    ori_chain_ids = tuple(
+                        [int_to_letters(chain_id_int + i) for i in range(count)]
+                    )
+
                 if entity_type in [PROTEIN, RNA, DNA]:
                     sequence = entity_dict["sequence"]
                     modifications = []
@@ -321,6 +360,7 @@ class ProtenixInput:
                         sequence=sequence,
                         entity_type=entity_type,
                         modifications=tuple(modifications),
+                        ori_chain_id=ori_chain_ids[0] if ori_chain_ids else None,
                     )
 
                 else:
@@ -341,7 +381,7 @@ class ProtenixInput:
                         ccd_codes=tuple(ccd_codes) if ccd_codes else None,
                         file_path=file_path,
                         smiles=smiles,
-                        ori_chain_id=int_to_letters(chain_id_int),
+                        ori_chain_id=ori_chain_ids[0] if ori_chain_ids else None,
                         ori_entity_id=entity_id,
                     )
 
@@ -349,9 +389,7 @@ class ProtenixInput:
                     entity_id=int(entity_id),
                     sequence=seq_obj,
                     count=count,
-                    ori_chain_ids=tuple(
-                        [int_to_letters(chain_id_int + i) for i in range(count)]
-                    ),
+                    ori_chain_ids=ori_chain_ids,
                 )
                 chain_id_int += count
                 all_seqs.append(entity_obj)
@@ -434,6 +472,25 @@ class ProtenixInput:
 
         json_dict = json_lst[0]
         return cls.from_json(json_dict)
+
+    @classmethod
+    def from_json_file_multi(cls, json_f: Union[Path, str]) -> list["ProtenixInput"]:
+        """
+        Load all ProtenixInput entries from a JSON file containing a list of entries.
+
+        Args:
+            json_f (Path | str): Path to a JSON file.
+
+        Returns:
+            list[ProtenixInput]: List of reconstructed input objects.
+        """
+        with open(json_f, "r", encoding="utf-8") as f:
+            json_lst = json.load(f)
+
+        inputs = []
+        for json_dict in json_lst:
+            inputs.append(cls.from_json(json_dict))
+        return inputs
 
     @staticmethod
     def _merge_covalent_bonds(
@@ -525,9 +582,15 @@ class ProtenixInput:
         seqs = []
         id_to_index = {}
         for entity in self.sequences:
-            for copy_id in range(1, entity.count + 1):
+            for i, copy_id in enumerate(range(1, entity.count + 1)):
                 id_to_index[(entity.entity_id, copy_id)] = len(seqs)
-                seqs.append(entity.sequence)
+
+                # Clone sequence to avoid sharing mutable state and to assign distinct ori_chain_id
+                new_seq = copy.deepcopy(entity.sequence)
+                if i < len(entity.ori_chain_ids):
+                    new_seq.ori_chain_id = entity.ori_chain_ids[i]
+
+                seqs.append(new_seq)
 
         bonds = []
         for px_bond in self.bonds:

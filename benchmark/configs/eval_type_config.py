@@ -40,7 +40,11 @@ PB_VALID_CHECK_COL = [
     "bond_lengths",
     "bond_angles",
     "aromatic_ring_flatness",
+    "non_aromatic_ring_non_flatness",  # pxm v.1.1.0 added
     "double_bond_flatness",
+    "sp2_center_flatness",  # pxm v.1.1.0 added
+    "amide_flatness",  # pxm v.1.1.0 added
+    "sp3_center_non_flatness",  # pxm v.1.1.0 added
     "internal_steric_clash",
     "internal_energy",
     "minimum_distance_to_protein",
@@ -49,4 +53,5 @@ PB_VALID_CHECK_COL = [
     "volume_overlap_with_protein",
     "volume_overlap_with_organic_cofactors",
     "volume_overlap_with_inorganic_cofactors",
+    "no_radicals",  # pxm v.1.1.0 added
 ]

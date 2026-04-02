@@ -46,11 +46,10 @@ class ChainInterfaceDisplayer:
         self.seeds = [str(i) for i in seeds] if seeds else None
         self.ranker_keys = MODEL_TO_RANKER_KEYS.get(model, MODEL_TO_RANKER_KEYS["nan"])
 
-    def _get_group_agg_funcs(
+    def _get_ranker_names(
         self,
-        metric_key: str,
         level: list[str] = None,
-    ) -> dict[str, callable]:
+    ) -> list[str]:
         if level is None:
             level = [
                 "complex",
@@ -58,33 +57,92 @@ class ChainInterfaceDisplayer:
                 "interface",
             ]
 
-        # Initialize with basic aggregation functions
-        agg_funcs = {
-            "best": lambda grp, m_key=metric_key: grp.loc[grp[m_key].idxmax()],
-            "worst": lambda grp, m_key=metric_key: grp.loc[grp[m_key].idxmin()],
-            "rand": lambda grp: grp.sample(n=1).iloc[0],
-            "median": lambda grp, m_key=metric_key: grp.loc[
-                (grp[m_key] - grp[m_key].median()).abs().idxmin()
-            ],
-        }
+        ranker_names = ["best", "worst", "rand", "median"]
 
         ranker_keys = []
         for lv in level:
             ranker_keys += self.ranker_keys[lv]
 
-        for ranker_key, ascending in ranker_keys:
+        for ranker_key, _ in ranker_keys:
             if ranker_key not in self.metrics_df.columns:
                 continue
+            ranker_names.append(f"best.{ranker_key}")
+        return ranker_names
 
-            def rank_func(
-                grp,
-                ranker_key=ranker_key,
-                ascending=ascending,
-            ):
-                return grp.sort_values(by=ranker_key, ascending=ascending).iloc[0]
+    def _select_representative_samples(
+        self,
+        df: pd.DataFrame,
+        agg_func_name: str,
+        group_by_key: list[str],
+        metric_key: str,
+        ranker_lookup: dict[str, bool],
+    ) -> pd.DataFrame | None:
+        """
+        Selects representative samples for each group based on the aggregation strategy.
+        Returns a sorted and deduplicated DataFrame if the strategy is vectorizable.
+        Otherwise returns None.
+        """
+        # Define tie-breakers for deterministic sorting
+        tie_breakers = []
+        tie_asc = []
+        if "seed" in df.columns:
+            tie_breakers.append("seed")
+            tie_asc.append(True)
+        if "sample" in df.columns:
+            tie_breakers.append("sample")
+            tie_asc.append(True)
 
-            agg_funcs[f"best.{ranker_key}"] = rank_func
-        return agg_funcs
+        if agg_func_name == "best":
+            return df.sort_values(
+                by=[metric_key] + tie_breakers, ascending=[False] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "worst":
+            return df.sort_values(
+                by=[metric_key] + tie_breakers, ascending=[True] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "rand":
+            return df.sample(frac=1).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "median":
+            # Vectorized median selection
+            # Calculate median for each group
+            median_series = df.groupby(group_by_key, observed=True)[
+                metric_key
+            ].transform("median")
+            # Calculate absolute difference
+            # Use a temporary column name unlikely to clash
+            diff_col = f"_median_diff_{metric_key}"
+            df = df.copy()
+            df[diff_col] = (df[metric_key] - median_series).abs()
+            # Sort by difference
+            return (
+                df.sort_values(
+                    by=[diff_col] + tie_breakers,
+                    ascending=[True] + tie_asc,
+                )
+                .drop_duplicates(subset=group_by_key)
+                .drop(columns=[diff_col])
+            )
+        if agg_func_name in ranker_lookup:
+            asc = ranker_lookup[agg_func_name]
+            # agg_func_name is like "best.{ranker_key}"
+            rk = agg_func_name.split(".", 1)[1]
+            if rk in df.columns:
+                # Ensure the column used for sorting is numeric
+                # Create a temporary numeric column for sorting to handle string issues
+                # such as "10.0" < "9.0" being True when sorting as strings
+                temp_col = f"_tmp_sort_{rk}"
+                df = df.copy()
+                df[temp_col] = pd.to_numeric(df[rk], errors="coerce")
+
+                sorted_df = df.sort_values(
+                    by=[temp_col] + tie_breakers, ascending=[asc] + tie_asc
+                )
+
+                return sorted_df.drop_duplicates(subset=group_by_key).drop(
+                    columns=[temp_col]
+                )
+
+        raise ValueError(f"Unknown aggregation strategy: {agg_func_name}")
 
     def get_dockq_sr_by_cluster(
         self,
@@ -135,6 +193,8 @@ class ChainInterfaceDisplayer:
         if "cluster_id" not in metrics_df.columns:
             # Set a default cluster_id
             metrics_df["cluster_id"] = [str(i) for i in range(len(metrics_df))]
+        else:
+            metrics_df = metrics_df.dropna(subset=["cluster_id"]).copy()
 
         if self.seeds:
             # Selected by seeds
@@ -147,9 +207,13 @@ class ChainInterfaceDisplayer:
         metrics_df.dropna(subset=["dockq"], inplace=True, how="all", axis=0)
 
         # Func name: func apply to a group
-        dockq_agg_func = self._get_group_agg_funcs(
-            "dockq", level=["complex", "interface"]
-        )
+        dockq_ranker_names = self._get_ranker_names(level=["complex", "interface"])
+
+        ranker_lookup = {}
+        for lv in ["complex", "interface"]:
+            if lv in self.ranker_keys:
+                for rk, asc in self.ranker_keys[lv]:
+                    ranker_lookup[f"best.{rk}"] = asc
 
         dockq_results = []
         dockq_details = []
@@ -161,39 +225,60 @@ class ChainInterfaceDisplayer:
 
             entry_id_num = len(eval_df["entry_id"].unique())
 
-            for agg_func_name, agg_func in dockq_agg_func.items():
+            for agg_func_name in dockq_ranker_names:
                 cluster_id_to_dockq_scores = defaultdict(list)
                 # DockQ only has interface metric
                 group_by_key = ["entry_id", "chain_id_1", "chain_id_2"]
-                for group_id, group_df in eval_df.groupby(
-                    by=group_by_key, observed=True
-                ):
-                    cluster_id = group_df["cluster_id"].iloc[0]
-                    sample_dockq_row = agg_func(group_df)
-                    sample_dockq_value = sample_dockq_row["dockq"]
-                    cluster_id_to_dockq_scores[cluster_id].append(sample_dockq_value)
 
-                    dockq_details.append(
-                        {
-                            "seed": sample_dockq_row["seed"],
-                            "sample": sample_dockq_row["sample"],
-                            "ranker": agg_func_name,
-                            "eval_type": eval_type,
-                            "entry_id": group_id[0],
-                            "entity_id_1": sample_dockq_row["entity_id_1"],
-                            "entity_id_2": sample_dockq_row["entity_id_2"],
-                            "chain_id_1": group_id[1],
-                            "chain_id_2": group_id[2],
-                            "cluster_id": cluster_id,
-                            "dockq": sample_dockq_value,
-                        }
-                    )
+                selected_df = self._select_representative_samples(
+                    eval_df, agg_func_name, group_by_key, "dockq", ranker_lookup
+                )
+
+                # Vectorized path
+                grouped_scores = selected_df.groupby("cluster_id", observed=True)[
+                    "dockq"
+                ].apply(list)
+                for cid, scores in grouped_scores.items():
+                    cluster_id_to_dockq_scores[cid].extend(scores)
+
+                details_subset = selected_df.copy()
+                details_subset["ranker"] = agg_func_name
+                details_subset["eval_type"] = eval_type
+
+                ranker_metric = None
+                if agg_func_name.startswith("best."):
+                    ranker_metric = agg_func_name.split(".", 1)[1]
+                elif agg_func_name in ["best", "worst", "median", "rand"]:
+                    ranker_metric = "dockq"
+
+                if ranker_metric and ranker_metric in details_subset.columns:
+                    details_subset["ranker_val"] = details_subset[ranker_metric]
+                else:
+                    details_subset["ranker_val"] = np.nan
+
+                detail_records = details_subset[
+                    [
+                        "seed",
+                        "sample",
+                        "ranker",
+                        "ranker_val",
+                        "eval_type",
+                        "entry_id",
+                        "entity_id_1",
+                        "entity_id_2",
+                        "chain_id_1",
+                        "chain_id_2",
+                        "cluster_id",
+                        "dockq",
+                    ]
+                ].to_dict("records")
+                dockq_details.extend(detail_records)
 
                 # avg_dockq_sr_avg_sr: mean DockQ SR in a cluster, and mean for all SR for all clusters
                 # avg_dockq_avg_sr: mean DockQ in a cluster, and mean SR for all clusters
                 all_avg_dockq = []
                 all_avg_dockq_sr = []
-                for cluster_id, dockq_scores in cluster_id_to_dockq_scores.items():
+                for _cluster_id, dockq_scores in cluster_id_to_dockq_scores.items():
                     avg_dockq = np.mean(dockq_scores)
                     avg_dockq_sr = np.mean(np.array(dockq_scores) > success_threshold)
 
@@ -257,6 +342,8 @@ class ChainInterfaceDisplayer:
         if "cluster_id" not in metrics_df.columns:
             # Set a default cluster_id
             metrics_df["cluster_id"] = [str(i) for i in range(len(metrics_df))]
+        else:
+            metrics_df = metrics_df.dropna(subset=["cluster_id"]).copy()
 
         if self.seeds:
             # Selected by seeds
@@ -273,12 +360,23 @@ class ChainInterfaceDisplayer:
 
         lddt_results = []
         lddt_details = []
-        lddt_chain_agg_funcs = self._get_group_agg_funcs(
-            "lddt", level=["complex", "chain"]
+        lddt_chain_ranker_names = self._get_ranker_names(level=["complex", "chain"])
+        lddt_interface_ranker_names = self._get_ranker_names(
+            level=["complex", "interface"]
         )
-        lddt_interface_agg_funcs = self._get_group_agg_funcs(
-            "lddt", level=["complex", "interface"]
-        )
+
+        chain_ranker_lookup = {}
+        for lv in ["complex", "chain"]:
+            if lv in self.ranker_keys:
+                for rk, asc in self.ranker_keys[lv]:
+                    chain_ranker_lookup[f"best.{rk}"] = asc
+
+        interface_ranker_lookup = {}
+        for lv in ["complex", "interface"]:
+            if lv in self.ranker_keys:
+                for rk, asc in self.ranker_keys[lv]:
+                    interface_ranker_lookup[f"best.{rk}"] = asc
+
         for eval_type in all_eval_types.keys():
             eval_df = select_df_by_eval_types(metrics_df, [eval_type])
 
@@ -291,53 +389,71 @@ class ChainInterfaceDisplayer:
 
             if eval_type.startswith("Intra"):
                 eval_type_level = "chain"
-                lddt_agg_funcs = lddt_chain_agg_funcs
+                lddt_ranker_names = lddt_chain_ranker_names
+                ranker_lookup = chain_ranker_lookup
             else:
                 eval_type_level = "interface"
-                lddt_agg_funcs = lddt_interface_agg_funcs
+                lddt_ranker_names = lddt_interface_ranker_names
+                ranker_lookup = interface_ranker_lookup
 
             entry_id_num = len(eval_df["entry_id"].unique())
 
-            for agg_func_name, agg_func in lddt_agg_funcs.items():
+            for agg_func_name in lddt_ranker_names:
                 cluster_id_to_lddt_scores = defaultdict(list)
                 if eval_type_level == "chain":
                     group_by_key = ["entry_id", "chain_id_1"]
                 else:
                     group_by_key = ["entry_id", "chain_id_1", "chain_id_2"]
 
-                for group_id, group_df in eval_df.groupby(
-                    by=group_by_key, observed=True
-                ):
-                    cluster_id = group_df["cluster_id"].iloc[0]
-                    sample_lddt_row = agg_func(group_df)
-                    sample_lddt_value = sample_lddt_row["lddt"]
-                    cluster_id_to_lddt_scores[cluster_id].append(sample_lddt_value)
+                selected_df = self._select_representative_samples(
+                    eval_df, agg_func_name, group_by_key, "lddt", ranker_lookup
+                )
 
-                    if eval_type_level == "chain":
-                        chain_id_2 = ""
-                        entity_id_2 = ""
-                    else:
-                        chain_id_2 = group_id[2]
-                        entity_id_2 = sample_lddt_row["entity_id_2"]
+                grouped_scores = selected_df.groupby("cluster_id", observed=True)[
+                    "lddt"
+                ].apply(list)
+                for cid, scores in grouped_scores.items():
+                    cluster_id_to_lddt_scores[cid].extend(scores)
 
-                    lddt_details.append(
-                        {
-                            "seed": sample_lddt_row["seed"],
-                            "sample": sample_lddt_row["sample"],
-                            "ranker": agg_func_name,
-                            "eval_type": eval_type,
-                            "entry_id": group_id[0],
-                            "entity_id_1": sample_lddt_row["entity_id_1"],
-                            "entity_id_2": entity_id_2,
-                            "chain_id_1": group_id[1],
-                            "chain_id_2": chain_id_2,
-                            "cluster_id": cluster_id,
-                            "lddt": sample_lddt_value,
-                        }
-                    )
+                details_subset = selected_df.copy()
+                details_subset["ranker"] = agg_func_name
+                details_subset["eval_type"] = eval_type
+
+                ranker_metric = None
+                if agg_func_name.startswith("best."):
+                    ranker_metric = agg_func_name.split(".", 1)[1]
+                elif agg_func_name in ["best", "worst", "median", "rand"]:
+                    ranker_metric = "lddt"
+
+                if ranker_metric and ranker_metric in details_subset.columns:
+                    details_subset["ranker_val"] = details_subset[ranker_metric]
+                else:
+                    details_subset["ranker_val"] = np.nan
+
+                if eval_type_level == "chain":
+                    details_subset["chain_id_2"] = ""
+                    details_subset["entity_id_2"] = ""
+
+                fields = [
+                    "seed",
+                    "sample",
+                    "ranker",
+                    "ranker_val",
+                    "eval_type",
+                    "entry_id",
+                    "entity_id_1",
+                    "chain_id_1",
+                    "cluster_id",
+                    "lddt",
+                    "entity_id_2",
+                    "chain_id_2",
+                ]
+
+                lddt_details_records = details_subset[fields].to_dict("records")
+                lddt_details.extend(lddt_details_records)
 
                 all_avg_lddt = []
-                for cluster_id, lddt_scores in cluster_id_to_lddt_scores.items():
+                for _cluster_id, lddt_scores in cluster_id_to_lddt_scores.items():
                     avg_lddt = np.mean(lddt_scores)
                     all_avg_lddt.append(avg_lddt)
                 avg_avg_lddt = np.mean(all_avg_lddt)
@@ -353,6 +469,134 @@ class ChainInterfaceDisplayer:
                     "ci_lddt": lddt_ci,
                 }
                 lddt_results.append(lddt_result)
+
+        lddt_results_df = pd.DataFrame(lddt_results)
+        lddt_details_df = pd.DataFrame(lddt_details)
+        lddt_results_df["subset"] = subset_name
+        lddt_details_df["subset"] = subset_name
+        return lddt_results_df, lddt_details_df
+
+    def get_lddt_pli(
+        self,
+        mask_on_metrics_df: Sequence[bool] | None = None,
+        subset_name: str = "All",
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Calculate LDDT-PLI metrics for ligand chains.
+
+        Args:
+            mask_on_metrics_df (Sequence[bool] | None): A mask to filter the metrics DataFrame. Defaults to None.
+            subset_name (str): The name of the subset.
+
+        Returns:
+            tuple[pd.DataFrame, pd.DataFrame]: A tuple containing two DataFrames:
+                - lddt_results_df: A DataFrame containing the calculated LDDT-PLI metrics.
+                - lddt_details_df: A DataFrame containing the details of each sample.
+        """
+        if mask_on_metrics_df is not None:
+            metrics_df = self.metrics_df[mask_on_metrics_df].copy()
+        else:
+            metrics_df = self.metrics_df.copy()
+
+        lddt_df = metrics_df[metrics_df["type"] == "chain"].copy()
+
+        if self.seeds:
+            lddt_df = lddt_df[lddt_df["seed"].astype(str).isin(self.seeds)].copy()
+
+        if "lddt_pli" not in lddt_df.columns:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Drop NaN rows in lddt_pli column
+        lddt_df.dropna(subset=["lddt_pli"], inplace=True, how="all", axis=0)
+        if lddt_df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # LDDT-PLI is agregated without cluster_id
+        lddt_df["cluster_id"] = (
+            lddt_df["entry_id"].astype(str) + "_" + lddt_df["chain_id_1"].astype(str)
+        )
+
+        entry_id_num = len(lddt_df["entry_id"].unique())
+
+        lddt_results = []
+        lddt_details = []
+
+        ranker_names = self._get_ranker_names(level=["complex", "chain"])
+
+        ranker_lookup = {}
+        for lv in ["complex", "chain"]:
+            if lv in self.ranker_keys:
+                for rk, asc in self.ranker_keys[lv]:
+                    ranker_lookup[f"best.{rk}"] = asc
+
+        for agg_func_name in ranker_names:
+            cluster_id_to_lddt_scores = defaultdict(list)
+
+            group_by_key = ["entry_id", "chain_id_1"]
+            selected_df = self._select_representative_samples(
+                lddt_df, agg_func_name, group_by_key, "lddt_pli", ranker_lookup
+            )
+
+            # Vectorized
+            grouped_scores = selected_df.groupby("cluster_id", observed=True)[
+                "lddt_pli"
+            ].apply(list)
+            for cid, scores in grouped_scores.items():
+                cluster_id_to_lddt_scores[cid].extend(scores)
+
+            details_subset = selected_df.copy()
+            details_subset["ranker"] = agg_func_name
+            details_subset["eval_type"] = "LDDT-PLI"
+
+            ranker_metric = None
+            if agg_func_name.startswith("best."):
+                ranker_metric = agg_func_name.split(".", 1)[1]
+            elif agg_func_name in ["best", "worst", "median", "rand"]:
+                ranker_metric = "lddt_pli"
+
+            if ranker_metric and ranker_metric in details_subset.columns:
+                details_subset["ranker_val"] = details_subset[ranker_metric]
+            else:
+                details_subset["ranker_val"] = np.nan
+
+            details_subset["entity_id_2"] = ""
+            details_subset["chain_id_2"] = ""
+            # lddt column name is "lddt" in result, but metric is "lddt_pli"
+            details_subset["lddt"] = details_subset["lddt_pli"]
+
+            fields = [
+                "seed",
+                "sample",
+                "ranker",
+                "ranker_val",
+                "eval_type",
+                "entry_id",
+                "entity_id_1",
+                "entity_id_2",
+                "chain_id_1",
+                "chain_id_2",
+                "cluster_id",
+                "lddt",
+            ]
+            lddt_details.extend(details_subset[fields].to_dict("records"))
+
+            all_avg_lddt = []
+            for _cluster_id, lddt_scores in cluster_id_to_lddt_scores.items():
+                avg_lddt = np.mean(lddt_scores)
+                all_avg_lddt.append(avg_lddt)
+
+            avg_avg_lddt = np.mean(all_avg_lddt)
+            lddt_ci = get_bootstrap_ci(all_avg_lddt)
+
+            lddt_result = {
+                "eval_type": "LDDT-PLI",
+                "entry_id_num": entry_id_num,
+                "cluster_num": len(cluster_id_to_lddt_scores),
+                "ranker": agg_func_name,
+                "lddt": avg_avg_lddt,
+                "ci_lddt": lddt_ci,
+            }
+            lddt_results.append(lddt_result)
 
         lddt_results_df = pd.DataFrame(lddt_results)
         lddt_details_df = pd.DataFrame(lddt_details)
@@ -393,75 +637,138 @@ class RMSDDisplayer:
         metrics_df: pd.DataFrame, pb_valid_df: pd.DataFrame
     ) -> pd.DataFrame:
         match_keys = ["entry_id", "seed", "sample", "chain_id_1", "type"]
+        exist_pb_keys = [i for i in PB_VALID_CHECK_COL if i in pb_valid_df.columns]
 
         merged_metrics_df = pd.merge(
             metrics_df.reset_index(),
-            pb_valid_df[match_keys + PB_VALID_CHECK_COL],
+            pb_valid_df[match_keys + exist_pb_keys],
             how="left",
             on=match_keys,
         ).set_index("index")
         merged_metrics_df.index.name = metrics_df.index.name
 
-        # Add penalty column as denominator: 0 or 100
-        merged_metrics_df["penalty"] = merged_metrics_df.apply(
-            lambda row: (
-                (
-                    not pd.isna(row["minimum_distance_to_protein"])
-                    and not row["minimum_distance_to_protein"]
+        if (
+            "minimum_distance_to_protein" in exist_pb_keys
+            and "tetrahedral_chirality" in exist_pb_keys
+        ):
+            # Add penalty column as denominator: 0 or 100
+            merged_metrics_df["penalty"] = merged_metrics_df.apply(
+                lambda row: (
+                    (
+                        not pd.isna(row["minimum_distance_to_protein"])
+                        and not row["minimum_distance_to_protein"]
+                    )
+                    or (
+                        not pd.isna(row["tetrahedral_chirality"])
+                        and not row["tetrahedral_chirality"]
+                    )
                 )
-                or (
-                    not pd.isna(row["tetrahedral_chirality"])
-                    and not row["tetrahedral_chirality"]
-                )
+                * 100,
+                axis=1,
             )
-            * 100,
-            axis=1,
-        )
 
         return merged_metrics_df
 
-    def _get_rmsd_agg_funcs(
+    def _get_ranker_names(
         self,
-    ) -> dict[str, callable]:
+    ) -> list[str]:
         # Initialize with basic aggregation functions
-        agg_funcs = {
-            "best": lambda grp: grp.sort_values(by="lig_rmsd", ascending=True).iloc[0],
-            "worst": lambda grp: grp.sort_values(by="lig_rmsd", ascending=False).iloc[
-                0
-            ],
-            "rand": lambda grp: grp.sample(n=1).iloc[0],
-            "median": lambda grp: grp.loc[
-                (grp["lig_rmsd"] - grp["lig_rmsd"].median()).abs().idxmin()
-            ],
-        }
+        ranker_names = ["best", "worst", "rand", "median"]
 
         for _level, ranker_list in self.ranker_keys.items():
-            for ranker_key, ascending in ranker_list:
+            for ranker_key, _ in ranker_list:
                 if ranker_key not in self.metrics_df.columns:
                     continue
 
-                def rank_func(grp, ranker_key=ranker_key, ascending=ascending):
-                    return grp.sort_values(by=ranker_key, ascending=ascending).iloc[0]
-
-                agg_funcs[f"best.{ranker_key}"] = rank_func
+                ranker_names.append(f"best.{ranker_key}")
 
                 if "penalty" in self.metrics_df.columns:
+                    ranker_names.append(f"best.{ranker_key}.penalized")
 
-                    def penalized_rank_func(
-                        grp, ranker_key=ranker_key, ascending=ascending
-                    ):
-                        penalized_ranker_key = f"{ranker_key}.penalized"
-                        if ascending:
-                            grp[penalized_ranker_key] = grp[ranker_key] + grp["penalty"]
-                        else:
-                            grp[penalized_ranker_key] = grp[ranker_key] - grp["penalty"]
-                        return grp.sort_values(
-                            by=penalized_ranker_key, ascending=ascending
-                        ).iloc[0]
+        return ranker_names
 
-                    agg_funcs[f"best.{ranker_key}.penalized"] = penalized_rank_func
+    def _select_representative_samples(
+        self,
+        df: pd.DataFrame,
+        agg_func_name: str,
+        group_by_key: list[str],
+        metric_key: str,
+        ranker_lookup: dict[str, bool],
+    ) -> pd.DataFrame | None:
+        """
+        Selects representative samples for each group based on the aggregation strategy.
+        Returns a sorted and deduplicated DataFrame if the strategy is vectorizable.
+        Otherwise returns None.
+        """
+        # Define tie-breakers for deterministic sorting
+        tie_breakers = []
+        tie_asc = []
+        if "seed" in df.columns:
+            tie_breakers.append("seed")
+            tie_asc.append(True)
+        if "sample" in df.columns:
+            tie_breakers.append("sample")
+            tie_asc.append(True)
 
-        return agg_funcs
+        if agg_func_name == "best":
+            # For RMSD, lower is better
+            return df.sort_values(
+                by=[metric_key] + tie_breakers, ascending=[True] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "worst":
+            return df.sort_values(
+                by=[metric_key] + tie_breakers, ascending=[False] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "rand":
+            return df.sample(frac=1).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "median":
+            # Vectorized median selection
+            # Calculate median for each group
+            median_series = df.groupby(group_by_key, observed=True)[
+                metric_key
+            ].transform("median")
+            # Calculate absolute difference
+            diff_col = f"_median_diff_{metric_key}"
+            df = df.copy()
+            df[diff_col] = (df[metric_key] - median_series).abs()
+            # Sort by difference
+            return (
+                df.sort_values(by=[diff_col] + tie_breakers, ascending=[True] + tie_asc)
+                .drop_duplicates(subset=group_by_key)
+                .drop(columns=[diff_col])
+            )
+
+        # Handle best.{ranker_key} and best.{ranker_key}.penalized
+        is_penalized = agg_func_name.endswith(".penalized")
+        lookup_name = agg_func_name
+        if is_penalized:
+            lookup_name = agg_func_name.replace(".penalized", "")
+
+        if lookup_name in ranker_lookup:
+            asc = ranker_lookup[lookup_name]
+            rk = lookup_name.split(".", 1)[1]
+
+            if rk not in df.columns:
+                return None
+
+            # Ensure the column used for sorting is numeric
+            # Use a copy to avoid SettingWithCopyWarning
+            df = df.copy()
+            df[rk] = pd.to_numeric(df[rk], errors="coerce")
+
+            sort_col = rk
+            if is_penalized and "penalty" in df.columns:
+                penalized_col = f"{rk}_penalized_temp"
+                if asc:
+                    df[penalized_col] = df[rk] + df["penalty"]
+                else:
+                    df[penalized_col] = df[rk] - df["penalty"]
+                sort_col = penalized_col
+
+            return df.sort_values(
+                by=[sort_col] + tie_breakers, ascending=[asc] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        return None
 
     def get_rmsd(
         self,
@@ -526,8 +833,14 @@ class RMSDDisplayer:
 
         rmsd_results = []
         rmsd_details = []
-        rmsd_agg_funcs = self._get_rmsd_agg_funcs()
-        for agg_func_name, agg_func in rmsd_agg_funcs.items():
+        ranker_names = self._get_ranker_names()
+
+        ranker_lookup = {}
+        for _lv, ranker_list in self.ranker_keys.items():
+            for rk, asc in ranker_list:
+                ranker_lookup[f"best.{rk}"] = asc
+
+        for agg_func_name in ranker_names:
             all_lig_rmsd = []
 
             # cluster_pb_all_valid_flags[cluster_id] -> list[int]
@@ -539,61 +852,111 @@ class RMSDDisplayer:
 
             cluster_id_to_rmsd_scores = defaultdict(list)
 
-            for group_id, group_df in rmsd_df.groupby(
-                by=["entry_id", "chain_id_1"], observed=True
-            ):
-                sample_row = agg_func(group_df)
-                sample_lig_rmsd = sample_row["lig_rmsd"]
-                sample_pocket_rmsd = sample_row["pocket_rmsd"]
-                cluster_id = sample_row["cluster_id"]
+            group_by_key = ["entry_id", "chain_id_1"]
 
-                rmsd_detail = {
-                    "seed": sample_row["seed"],
-                    "sample": sample_row["sample"],
-                    "eval_type": "RMSD",
-                    "ranker": agg_func_name,
-                    "entry_id": group_id[0],
-                    "entity_id_1": sample_row["entity_id_1"],
-                    "entity_id_2": "",
-                    "chain_id_1": group_id[1],
-                    "chain_id_2": "",
-                    "cluster_id": cluster_id,
-                    "lig_rmsd": sample_lig_rmsd,
-                    "pocket_rmsd": sample_pocket_rmsd,
-                }
+            selected_df = self._select_representative_samples(
+                rmsd_df, agg_func_name, group_by_key, "lig_rmsd", ranker_lookup
+            )
 
-                sample_pb_flags = []
-                for check_col in existed_pb_check_rows:
-                    check_result = sample_row[check_col]
-                    # if NaN, it will be True -> 1
-                    check_flag = 1 if pd.isna(check_result) or bool(check_result) else 0
-                    rmsd_detail[check_col] = check_flag
-                    all_pb_valid[check_col][cluster_id].append(check_flag)
-                    sample_pb_flags.append(check_flag)
+            # 1. Collect lig_rmsd by cluster_id
+            grouped_scores = selected_df.groupby("cluster_id", observed=True)[
+                "lig_rmsd"
+            ].apply(list)
+            for cid, scores in grouped_scores.items():
+                cluster_id_to_rmsd_scores[cid].extend(scores)
 
-                if existed_pb_check_rows:
-                    all_valid_flag = int(all(sample_pb_flags))
-                    cluster_pb_all_valid_flags[cluster_id].append(all_valid_flag)
+            # 2. Collect all lig_rmsd (flat)
+            all_lig_rmsd.extend(selected_df["lig_rmsd"].tolist())
 
-                    good_rmsd_flag = int(
-                        (sample_lig_rmsd is not None)
-                        and (sample_lig_rmsd < success_threshold)
-                        and bool(all_valid_flag)
-                    )
-                    cluster_pb_all_valid_and_good_rmsd_flags[cluster_id].append(
-                        good_rmsd_flag
-                    )
+            # 3. Handle PB checks
+            temp_details = selected_df.copy()
 
-                rmsd_details.append(rmsd_detail)
-                all_lig_rmsd.append(sample_lig_rmsd)
-                cluster_id_to_rmsd_scores[cluster_id].append(sample_lig_rmsd)
+            # Calculate flags for each row
+            sample_pb_flags_cols = []
+            for check_col in existed_pb_check_rows:
+                flag_col_name = f"{check_col}_flag"
+                # Use .where to avoid pandas FutureWarning about downcasting behavior in .fillna
+                filled_series = temp_details[check_col].where(
+                    temp_details[check_col].notna(), True
+                )
+                temp_details[flag_col_name] = filled_series.astype(bool).astype(int)
+                sample_pb_flags_cols.append(flag_col_name)
+
+                grouped_flags = temp_details.groupby("cluster_id", observed=True)[
+                    flag_col_name
+                ].apply(list)
+                for cid, flags in grouped_flags.items():
+                    all_pb_valid[check_col][cid].extend(flags)
+
+            if existed_pb_check_rows:
+                temp_details["all_valid_flag"] = (
+                    temp_details[sample_pb_flags_cols].all(axis=1).astype(int)
+                )
+
+                grouped_all_valid = temp_details.groupby("cluster_id", observed=True)[
+                    "all_valid_flag"
+                ].apply(list)
+                for cid, flags in grouped_all_valid.items():
+                    cluster_pb_all_valid_flags[cid].extend(flags)
+
+                temp_details["good_rmsd_flag"] = (
+                    (temp_details["lig_rmsd"] < success_threshold)
+                    & (temp_details["all_valid_flag"] == 1)
+                ).astype(int)
+
+                grouped_good_rmsd = temp_details.groupby("cluster_id", observed=True)[
+                    "good_rmsd_flag"
+                ].apply(list)
+                for cid, flags in grouped_good_rmsd.items():
+                    cluster_pb_all_valid_and_good_rmsd_flags[cid].extend(flags)
+
+            temp_details["eval_type"] = "RMSD"
+            temp_details["ranker"] = agg_func_name
+
+            ranker_metric = None
+            if agg_func_name.startswith("best."):
+                ranker_metric = agg_func_name.split(".", 1)[1]
+                if ranker_metric.endswith(".penalized"):
+                    base_metric = ranker_metric.replace(".penalized", "")
+                    ranker_metric = f"{base_metric}_penalized_temp"
+            elif agg_func_name in ["best", "worst", "median"]:
+                ranker_metric = "lig_rmsd"
+
+            if ranker_metric and ranker_metric in temp_details.columns:
+                temp_details["ranker_val"] = temp_details[ranker_metric]
+            else:
+                temp_details["ranker_val"] = np.nan
+
+            temp_details["entity_id_2"] = ""
+            temp_details["chain_id_2"] = ""
+
+            for check_col, flag_col in zip(existed_pb_check_rows, sample_pb_flags_cols):
+                temp_details[check_col] = temp_details[flag_col]
+
+            fields = [
+                "seed",
+                "sample",
+                "eval_type",
+                "ranker",
+                "ranker_val",
+                "entry_id",
+                "entity_id_1",
+                "entity_id_2",
+                "chain_id_1",
+                "chain_id_2",
+                "cluster_id",
+                "lig_rmsd",
+                "pocket_rmsd",
+            ] + existed_pb_check_rows
+
+            rmsd_details.extend(temp_details[fields].to_dict("records"))
 
             if len(all_lig_rmsd) == 0:
                 continue
 
             all_avg_lig_rmsd = []
             all_avg_lig_rmsd_sr = []
-            for cluster_id, rmsd_scores in cluster_id_to_rmsd_scores.items():
+            for _cluster_id, rmsd_scores in cluster_id_to_rmsd_scores.items():
                 rmsd_arr = np.asarray(rmsd_scores, dtype=float)
                 avg_lig_rmsd = float(np.mean(rmsd_arr))
                 avg_lig_rmsd_sr = float(np.mean(rmsd_arr < success_threshold))
@@ -657,3 +1020,326 @@ class RMSDDisplayer:
         rmsd_results_df["subset"] = subset_name
         rmsd_details_df["subset"] = subset_name
         return rmsd_results_df, rmsd_details_df
+
+    def get_ligand_combined_metrics(
+        self,
+        mask_on_metrics_df: Sequence[bool] | None = None,
+        subset_name: str = "All",
+    ) -> pd.DataFrame:
+        """
+        Calculate combined metrics for ligand predictions directly from metrics dataframe.
+
+        The combined metric is the success rate of (lig_rmsd < 2.0 AND lddt_pli > 0.8).
+        It is calculated by averaging the success flags across all samples (not aggregated by cluster).
+
+        Args:
+            mask_on_metrics_df (Sequence[bool] | None): A mask to filter the metrics DataFrame. Defaults to None.
+            subset_name (str): The name of the subset.
+
+        Returns:
+            pd.DataFrame: A DataFrame containing 'ranker', 'subset', and 'lig_rmsd_lddt_pli_sr'.
+        """
+        if mask_on_metrics_df is not None:
+            metrics_df = self.metrics_df[mask_on_metrics_df].copy()
+        else:
+            metrics_df = self.metrics_df.copy()
+
+        rmsd_df = metrics_df[metrics_df["type"] == "chain"].copy()
+
+        if self.seeds:
+            rmsd_df = rmsd_df[rmsd_df["seed"].astype(str).isin(self.seeds)].copy()
+
+        # Rename columns for legacy compatibility
+        if (
+            "lig_rmsd_wo_refl" in rmsd_df.columns
+            and "pocket_rmsd_wo_refl" in rmsd_df.columns
+        ) and (
+            "lig_rmsd" not in rmsd_df.columns and "pocket_rmsd" not in rmsd_df.columns
+        ):
+            rmsd_df = rmsd_df.rename(
+                columns={
+                    "lig_rmsd_wo_refl": "lig_rmsd",
+                    "pocket_rmsd_wo_refl": "pocket_rmsd",
+                }
+            )
+
+        if "lddt_pli" not in rmsd_df.columns:
+            # Cannot calculate if lddt_pli is missing
+            return pd.DataFrame()
+
+        # Drop NaN rows in lig_rmsd and lddt_pli columns
+        rmsd_df.dropna(subset=["lig_rmsd", "lddt_pli"], inplace=True, how="all", axis=0)
+
+        results = []
+        ranker_names = self._get_ranker_names()
+
+        ranker_lookup = {}
+        for _lv, ranker_list in self.ranker_keys.items():
+            for rk, asc in ranker_list:
+                ranker_lookup[f"best.{rk}"] = asc
+
+        for agg_func_name in ranker_names:
+            combined_success_flags = []
+
+            group_by_key = ["entry_id", "chain_id_1"]
+            selected_df = self._select_representative_samples(
+                rmsd_df, agg_func_name, group_by_key, "lig_rmsd", ranker_lookup
+            )
+
+            if "lddt_pli" in selected_df.columns:
+                flags = (
+                    (selected_df["lig_rmsd"] < 2.0) & (selected_df["lddt_pli"] > 0.8)
+                ).astype(int)
+                combined_success_flags = flags.tolist()
+            else:
+                combined_success_flags = [0] * len(selected_df)
+
+            if not combined_success_flags:
+                continue
+
+            sr = np.mean(combined_success_flags)
+            results.append(
+                {
+                    "ranker": agg_func_name,
+                    "lig_rmsd_lddt_pli_sr": sr,
+                    "subset": subset_name,
+                    "entry_id_num": len(rmsd_df["entry_id"].unique()),
+                    "cluster_num": len(
+                        combined_success_flags
+                    ),  # Calculated per case (entry+chain)
+                }
+            )
+
+        return pd.DataFrame(results)
+
+
+class CDRH3Displayer:
+    """
+    Displayer for CDR H3 RMSD metrics.
+
+    Args:
+        metrics_df (pd.DataFrame): The DataFrame containing the metrics data.
+        model (str, optional): The model name.
+        seeds (list[str or int], optional): The list of seeds.
+    """
+
+    def __init__(
+        self,
+        metrics_df: pd.DataFrame,
+        model: str | None = None,
+        seeds: list[str | int] | None = None,
+    ):
+        self.metrics_df = metrics_df
+        self.seeds = [str(i) for i in seeds] if seeds else None
+        self.ranker_keys = MODEL_TO_RANKER_KEYS.get(model, MODEL_TO_RANKER_KEYS["nan"])
+
+    def _get_ranker_names(self) -> list[str]:
+        ranker_names = ["best", "worst", "rand", "median"]
+
+        seen_rankers = set()
+        for lv in ["complex", "chain", "interface"]:
+            if lv in self.ranker_keys:
+                for r_key, _ in self.ranker_keys[lv]:
+                    if r_key in self.metrics_df.columns and r_key not in seen_rankers:
+                        seen_rankers.add(r_key)
+                        ranker_names.append(f"best.{r_key}")
+        return ranker_names
+
+    def _select_representative_samples(
+        self,
+        df: pd.DataFrame,
+        agg_func_name: str,
+        group_by_key: list[str],
+        metric_key: str,
+        ranker_lookup: dict[str, bool],
+    ) -> pd.DataFrame | None:
+        """
+        Selects representative samples for each group based on the aggregation strategy.
+        Returns a sorted and deduplicated DataFrame if the strategy is vectorizable.
+        Otherwise returns None.
+        """
+        # Define tie-breakers for deterministic sorting
+        tie_breakers = []
+        tie_asc = []
+        if "seed" in df.columns:
+            tie_breakers.append("seed")
+            tie_asc.append(True)
+        if "sample" in df.columns:
+            tie_breakers.append("sample")
+            tie_asc.append(True)
+
+        if agg_func_name == "best":
+            return df.sort_values(
+                by=[metric_key] + tie_breakers, ascending=[True] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "worst":
+            return df.sort_values(
+                by=[metric_key] + tie_breakers, ascending=[False] + tie_asc
+            ).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "rand":
+            return df.sample(frac=1).drop_duplicates(subset=group_by_key)
+        elif agg_func_name == "median":
+            # Vectorized median selection
+            # Calculate median for each group
+            median_series = df.groupby(group_by_key, observed=True)[
+                metric_key
+            ].transform("median")
+            # Calculate absolute difference
+            diff_col = f"_median_diff_{metric_key}"
+            df = df.copy()
+            df[diff_col] = (df[metric_key] - median_series).abs()
+            # Sort by difference
+            return (
+                df.sort_values(by=[diff_col] + tie_breakers, ascending=[True] + tie_asc)
+                .drop_duplicates(subset=group_by_key)
+                .drop(columns=[diff_col])
+            )
+        if agg_func_name in ranker_lookup:
+            asc = ranker_lookup[agg_func_name]
+            # agg_func_name is like "best.{ranker_key}"
+            rk = agg_func_name.split(".", 1)[1]
+            if rk in df.columns:
+                # Ensure the column used for sorting is numeric
+                # Create a temporary numeric column for sorting to handle string issues
+                # such as "10.0" < "9.0" being True when sorting as strings
+                temp_col = f"_tmp_sort_{rk}"
+                df = df.copy()
+                df[temp_col] = pd.to_numeric(df[rk], errors="coerce")
+
+                sorted_df = df.sort_values(
+                    by=[temp_col] + tie_breakers, ascending=[asc] + tie_asc
+                )
+
+                return sorted_df.drop_duplicates(subset=group_by_key).drop(
+                    columns=[temp_col]
+                )
+
+        raise ValueError(f"Unknown aggregation strategy: {agg_func_name}")
+
+    def get_cdr_h3_rmsd(
+        self,
+        success_threshold: float = 1.0,
+        mask_on_metrics_df: Sequence[bool] | None = None,
+        subset_name: str = "All",
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Calculate CDR H3 RMSD metrics.
+
+        Args:
+            success_threshold (float): The threshold for considering an RMSD value as a success.
+                            Defaults to 1.0.
+            mask_on_metrics_df (Sequence[bool] | None): A mask to filter the metrics DataFrame. Defaults to None.
+            subset_name (str): The name of the subset.
+
+        Returns:
+            tuple[pd.DataFrame, pd.DataFrame]: A tuple containing two DataFrames:
+                - results_df: A DataFrame containing the calculated metrics.
+                - details_df: A DataFrame containing the details of each sample.
+        """
+        if "cdr_h3_bb_rmsd" not in self.metrics_df.columns:
+            return pd.DataFrame(), pd.DataFrame()
+
+        if mask_on_metrics_df is not None:
+            df = self.metrics_df[mask_on_metrics_df].copy()
+        else:
+            df = self.metrics_df.copy()
+
+        # Filter NaN
+        df = df.dropna(subset=["cdr_h3_bb_rmsd"]).copy()
+        if df.empty:
+            return pd.DataFrame(), pd.DataFrame()
+
+        if self.seeds:
+            df = df[df["seed"].astype(str).isin(self.seeds)].copy()
+
+        ranker_names = self._get_ranker_names()
+
+        ranker_lookup = {}
+        for _lv, ranker_list in self.ranker_keys.items():
+            for rk, asc in ranker_list:
+                ranker_lookup[f"best.{rk}"] = asc
+
+        results = []
+        details = []
+
+        for ranker_name in ranker_names:
+            group_by_key = ["entry_id", "chain_id_1"]
+            selected_df = self._select_representative_samples(
+                df, ranker_name, group_by_key, "cdr_h3_bb_rmsd", ranker_lookup
+            )
+
+            selected_df["cluster_id"] = (
+                selected_df["entry_id"].astype(str)
+                + "_"
+                + selected_df["entity_id_1"].astype(str)
+            )
+            # Aggregate by cluster_id
+            cluster_means = selected_df.groupby("cluster_id", observed=True)[
+                "cdr_h3_bb_rmsd"
+            ].mean()
+            selected_df["_success"] = (
+                selected_df["cdr_h3_bb_rmsd"] <= success_threshold
+            ).astype(int)
+            cluster_sr = selected_df.groupby("cluster_id", observed=True)[
+                "_success"
+            ].mean()
+
+            vals = cluster_means.values.astype(float)
+            sr_vals = cluster_sr.values.astype(float)
+
+            mean_val = np.mean(vals)
+            sr_val = np.mean(sr_vals)
+
+            ranker_metric = None
+            if ranker_name.startswith("best."):
+                ranker_metric = ranker_name.split(".", 1)[1]
+            elif ranker_name in ["best", "worst", "median", "rand"]:
+                ranker_metric = "cdr_h3_bb_rmsd"
+
+            if ranker_metric and ranker_metric in selected_df.columns:
+                selected_df["ranker_val"] = selected_df[ranker_metric]
+            else:
+                selected_df["ranker_val"] = np.nan
+
+            det_df = selected_df[
+                [
+                    "seed",
+                    "sample",
+                    "entry_id",
+                    "chain_id_1",
+                    "entity_id_1",
+                    "cdr_h3_bb_rmsd",
+                    "ranker_val",
+                    "cluster_id",
+                ]
+            ].copy()
+            det_df["ranker"] = ranker_name
+            det_df["eval_type"] = "CDR_H3_BB_RMSD"
+            # cluster_id is already in det_df
+            details.append(det_df)
+
+            if len(vals) == len(selected_df):
+                # N_cluster == N_sample
+                # sr_vals contains only 0.0 or 1.0
+                sr_ci = get_binomial_ci(
+                    total_num=len(vals), success_num=int(sr_vals.sum())
+                )
+            else:
+                sr_ci = get_bootstrap_ci(list(sr_vals))
+
+            res = {
+                "ranker": ranker_name,
+                "cdr_h3_bb_avg_rmsd": mean_val,
+                "cdr_h3_bb_rmsd_sr": sr_val,
+                "ci_cdr_h3_bb_avg_rmsd": get_bootstrap_ci(list(vals)),
+                "ci_cdr_h3_bb_rmsd_sr": sr_ci,
+                "entry_id_num": selected_df["entry_id"].nunique(),
+                "cluster_num": len(vals),
+            }
+            results.append(res)
+
+        results_df = pd.DataFrame(results)
+        details_df = pd.concat(details) if details else pd.DataFrame()
+        results_df["subset"] = subset_name
+        details_df["subset"] = subset_name
+        return results_df, details_df

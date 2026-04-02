@@ -40,7 +40,16 @@ from biotite.structure.io.pdbx.convert import (
     InvalidFileError,
 )
 
+from pxmeter.constants import (
+    DNA,
+    DNA_STD_RESIDUES,
+    PRO_STD_RESIDUES,
+    PROTEIN,
+    RNA,
+    RNA_STD_RESIDUES,
+)
 from pxmeter.data.ccd import get_ccd_one_letter_code
+from pxmeter.data.utils import is_valid_date_format
 
 
 def get_assembly(
@@ -67,13 +76,13 @@ def get_assembly(
 
     Parameters
     ----------
-    pdbx_file : CIFFile or CIFBlock or BinaryCIFFile or BinaryCIFBlock
+    pdbx_file : Union[pdbx.CIFFile, pdbx.CIFBlock]
         The file object.
-    assembly_id : str
+    assembly_id : Optional[str]
         The assembly to build.
         Available assembly IDs can be obtained via
         :func:`list_assemblies()`.
-    model : int, optional
+    model : Optional[int]
         If this parameter is given, the function will return an
         :class:`AtomArray` from the atoms corresponding to the given
         model number (starting at 1).
@@ -82,13 +91,13 @@ def get_assembly(
         If this parameter is omitted, an :class:`AtomArrayStack`
         containing all models will be returned, even if the structure
         contains only one model.
-    data_block : str, optional
+    data_block : Optional[str]
         The name of the data block.
         Default is the first (and most times only) data block of the
         file.
         If the data block object is passed directly to `pdbx_file`,
         this parameter is ignored.
-    altloc : {'first', 'occupancy', 'all'}
+    altloc : str
         This parameter defines how *altloc* IDs are handled:
             - ``'first'`` - Use atoms that have the first *altloc* ID
               appearing in a residue.
@@ -98,7 +107,7 @@ def get_assembly(
               Note that this leads to duplicate atoms.
               When this option is chosen, the ``altloc_id`` annotation
               array is added to the returned structure.
-    extra_fields : list of str, optional
+    extra_fields : Optional[list[str]]
         The strings in the list are entry names, that are
         additionally added as annotation arrays.
         The annotation category name will be the same as the PDBx
@@ -108,7 +117,7 @@ def get_assembly(
         ``'atom_id'``, ``'b_factor'``, ``'occupancy'`` and ``'charge'``.
         These will convert the fitting subcategory into an
         annotation array with reasonable type.
-    use_author_fields : bool, optional
+    use_author_fields : bool
         Some fields can be read from two alternative sources,
         for example both, ``label_seq_id`` and ``auth_seq_id`` describe
         the ID of the residue.
@@ -119,7 +128,7 @@ def get_assembly(
         If `use_author_fields` is true, the annotation arrays will be
         read from the ``auth_xxx`` fields (if applicable),
         otherwise from the the ``label_xxx`` fields.
-    include_bonds : bool, optional
+    include_bonds : bool
         If set to true, a :class:`BondList` will be created for the
         resulting :class:`AtomArray` containing the bond information
         from the file.
@@ -131,7 +140,7 @@ def get_assembly(
 
     Returns
     -------
-    assembly : AtomArray or AtomArrayStack
+    Union[AtomArray, AtomArrayStack]
         The assembly.
         The return type depends on the `model` parameter.
         Contains the `sym_id` annotation, which enumerates the copies of the asymmetric
@@ -308,10 +317,52 @@ class MMCIFParser:
             Dict: A dict of label_entity_id --> entity_poly_type.
         """
         entity_poly = self.get_category_table("entity_poly")
-        if entity_poly is None:
+        if (
+            entity_poly is not None
+            and "type" in entity_poly.columns
+            and "entity_id" in entity_poly.columns
+        ):
+            return {i: t for i, t in zip(entity_poly.entity_id, entity_poly.type)}
+
+        # Fallback: Infer from atom_site if _entity_poly.type is missing
+        atom_site = self.get_category_table("atom_site")
+        if atom_site is None:
             return {}
 
-        return {i: t for i, t in zip(entity_poly.entity_id, entity_poly.type)}
+        entity = self.get_category_table("entity")
+        assert (
+            entity is not None and "type" in entity.columns
+        ), "Both _entity_poly.type and _entity.type are missing. Cannot infer entity types."
+
+        entity_types = {}
+        if entity is not None and "id" in entity.columns and "type" in entity.columns:
+            entity_types = {i: t for i, t in zip(entity.id, entity.type)}
+
+        poly_types = {}
+        for entity_id in atom_site["label_entity_id"].unique():
+            if entity_types.get(entity_id) == "non-polymer":
+                # We don't include non-polymer in entity_poly_type mapping
+                continue
+
+            res_names = atom_site[atom_site["label_entity_id"] == entity_id][
+                "label_comp_id"
+            ].unique()
+
+            pro_count = sum(1 for res in res_names if res in PRO_STD_RESIDUES)
+            rna_count = sum(1 for res in res_names if res in RNA_STD_RESIDUES)
+            dna_count = sum(1 for res in res_names if res in DNA_STD_RESIDUES)
+
+            max_count = max(pro_count, rna_count, dna_count)
+            if max_count == 0:
+                continue  # Or infer as other, but usually if 0 it might be ligand or unstandard polymer
+            elif max_count == pro_count:
+                poly_types[entity_id] = PROTEIN
+            elif max_count == rna_count:
+                poly_types[entity_id] = RNA
+            elif max_count == dna_count:
+                poly_types[entity_id] = DNA
+
+        return poly_types
 
     @functools.cached_property
     def exptl_methods(self) -> list[str]:
@@ -424,6 +475,14 @@ class MMCIFParser:
         # build reference entity atom array, including missing residues
         entity_poly_seq = self.get_category_table("entity_poly_seq")
         if entity_poly_seq is None:
+            # If entity_poly_seq is missing, fallback to entity_res_names inferred from atom_site
+            for entity_id, res_dict in entity_res_names.items():
+                if entity_id in self.entity_poly_type:
+                    # Sort by res_id to keep sequence order
+                    sorted_res_ids = sorted(res_dict.keys())
+                    poly_entity_id_to_res_names[entity_id] = [
+                        res_dict[res_id] for res_id in sorted_res_ids
+                    ]
             return poly_entity_id_to_res_names
 
         polymer_entities = set(entity_poly_seq["entity_id"])
@@ -709,3 +768,62 @@ class MMCIFParser:
             # Count from 1
             atom_site["id"] = np.arange(1, len(atom_site["group_PDB"]) + 1)
         return atom_site
+
+    @staticmethod
+    def get_release_date(cif_block: dict) -> str:
+        """
+        Get first release date.
+
+        Args:
+            cif_block (dict): mmcif_io.MMCIFParser dictionary.
+
+        Returns:
+            str: yyyy-mm-dd
+        """
+
+        if "pdbx_audit_revision_history" in cif_block:
+            history = cif_block["pdbx_audit_revision_history"]
+            # np.str_ is inherit from str, so return is str
+            date = history["revision_date"].as_array()[0]
+        else:
+            # no release date
+            date = "9999-12-31"
+
+        valid_date = is_valid_date_format(date)
+        assert (
+            valid_date
+        ), f"Invalid date format: {date}, it should be yyyy-mm-dd format"
+        return date
+
+    @staticmethod
+    def get_resolution(cif_block: dict) -> float:
+        """
+        Get resolution for X-ray and cryoEM.
+        Some methods don't have resolution, set as -1.0.
+
+        Args:
+            cif_block (dict): mmcif_io.MMCIFParser dictionary.
+
+        Returns:
+            float: resolution (set to -1.0 if not found)
+        """
+        resolution_names = [
+            "refine.ls_d_res_high",
+            "em_3d_reconstruction.resolution",
+            "reflns.d_resolution_high",
+        ]
+        for category_item in resolution_names:
+            category, item = category_item.split(".")
+            if category in cif_block and item in cif_block[category]:
+                try:
+                    resolution = cif_block[category][item].as_array(float)[0]
+                    # "." will be converted to 0.0, but it is not a valid resolution.
+                    if resolution == 0.0:
+                        continue
+                    return resolution
+                except ValueError:
+                    # in some cases, resolution_str is "?"
+                    continue
+            else:
+                continue
+        return -1.0

@@ -23,7 +23,21 @@ from biotite.structure.info import residue
 from biotite.structure.io.pdbx.convert import PDBX_BOND_TYPE_ID_TO_TYPE
 from rdkit import Chem
 
-from pxmeter.constants import LIGAND, POLYMER, PROTEIN_D, STD_RESIDUES
+from pxmeter.constants import (
+    DNA,
+    DNA_RNA_HYBRID,
+    DNA_STD_RESIDUES,
+    GLYCANS,
+    IONS,
+    LIGAND,
+    POLYMER,
+    PRO_STD_RESIDUES,
+    PROTEIN,
+    PROTEIN_D,
+    RNA,
+    RNA_STD_RESIDUES,
+    STD_RESIDUES,
+)
 from pxmeter.data.struct import Structure
 
 
@@ -383,6 +397,40 @@ class Sequences:
     bonds: tuple[Bond] = tuple()
 
     @staticmethod
+    def _resolve_hybrid_type(
+        structure: Structure,
+        entity_id: str,
+        res_id_and_name: np.ndarray,
+    ) -> str:
+        """
+        Resolve DNA/RNA hybrid type by counting residues.
+        """
+        mask = structure.atom_array.label_entity_id == entity_id
+        entity_res_id_and_name = res_id_and_name[mask]
+        unique_residues = np.unique(entity_res_id_and_name, axis=0)
+        unique_res_names = unique_residues[:, 1]
+
+        dna_count = np.sum(np.isin(unique_res_names, DNA_STD_RESIDUES))
+        rna_count = np.sum(np.isin(unique_res_names, RNA_STD_RESIDUES))
+
+        if dna_count > rna_count:
+            return DNA
+        return RNA
+
+    @staticmethod
+    def _get_std_residues(entity_type: str) -> tuple:
+        """
+        Get standard residues for the entity type.
+        """
+        if entity_type == DNA:
+            return DNA_STD_RESIDUES
+        elif entity_type == RNA:
+            return RNA_STD_RESIDUES
+        elif entity_type in (PROTEIN, PROTEIN_D):
+            return PRO_STD_RESIDUES
+        return STD_RESIDUES
+
+    @staticmethod
     def _get_polymer_seqs(structure: Structure) -> list[PolymerChainSequence]:
         atom_array = structure.atom_array
         res_id_and_name = np.stack((atom_array.res_id, atom_array.res_name), axis=1)
@@ -391,6 +439,15 @@ class Sequences:
             structure.entity_poly_seq.items(), key=lambda x: int(x[0])
         ):
             entity_type = structure.entity_poly_type[entity_id]
+
+            if entity_type == DNA_RNA_HYBRID:
+                entity_type = Sequences._resolve_hybrid_type(
+                    structure, entity_id, res_id_and_name
+                )
+                # Update entity type in structure
+                structure[entity_id] = entity_type
+
+            target_std_residues = Sequences._get_std_residues(entity_type)
 
             mod_positions = []
             mod_types = []
@@ -402,7 +459,7 @@ class Sequences:
                     res_id_and_name[structure.uni_chain_id == chain_id], axis=0
                 ):
                     if (
-                        res_name not in STD_RESIDUES
+                        res_name not in target_std_residues
                         and int(res_id) not in mod_positions
                     ):
                         mod_positions.append(int(res_id))
@@ -523,6 +580,7 @@ class Sequences:
         model: int = 1,
         altloc: str = "first",
         assembly_id: Optional[str] = None,
+        keep_polymer_crosslinks: bool = False,
     ) -> "Sequences":
         """
         Construct a `Sequences` object from an mmCIF file.
@@ -538,6 +596,8 @@ class Sequences:
                 (e.g., "first"). Defaults to "first".
             assembly_id (str | None, optional): If provided, expand the specified
                 biological assembly before extraction. Defaults to `None`.
+            keep_polymer_crosslinks (bool, optional): If True, keep polymer-polymer
+                crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list. Defaults to False.
 
         Returns:
             Sequences: Container with chain descriptors and filtered bonds.
@@ -555,7 +615,7 @@ class Sequences:
         # Only support protein, dna, rna
         non_std_polymer_entities = []
         for entity_id, entity_type in structure.entity_poly_type.items():
-            if entity_type not in (POLYMER + [PROTEIN_D]):
+            if entity_type not in (POLYMER + [PROTEIN_D, DNA_RNA_HYBRID]):
                 non_std_polymer_entities.append(entity_id)
         non_std_polymer_entity_mask = ~np.isin(
             structure.atom_array.label_entity_id, non_std_polymer_entities
@@ -567,7 +627,10 @@ class Sequences:
         all_seqs = polymer_seqs + non_polymer_seqs
 
         bonds = Sequences._get_bonds_from_structure(
-            structure, all_seqs, keep_polymer_crosslinks=False, remove_metalc=True
+            structure,
+            all_seqs,
+            keep_polymer_crosslinks=keep_polymer_crosslinks,
+            remove_metalc=True,
         )
         return cls(name=structure.entry_id, sequences=tuple(all_seqs), bonds=bonds)
 
@@ -582,3 +645,163 @@ class Sequences:
             int: Sum of tokens across `sequences`.
         """
         return sum(seq.get_num_tokens() for seq in self.sequences)
+
+
+class SequencesFilter:
+    """
+    Filter sequences and bonds based on entity type.
+    """
+
+    def __init__(self, sequences: Sequences):
+        self.sequences_obj = sequences
+
+    def _filter(self, keep_indices: list[int]) -> Sequences:
+        """
+        Filter sequences and bonds based on keep_indices.
+
+        Args:
+            keep_indices (list[int]): List of indices to keep from self.sequences_obj.sequences.
+
+        Returns:
+            Sequences: Filtered Sequences object.
+        """
+        # 1. Create new list of sequences
+        old_sequences = self.sequences_obj.sequences
+        new_sequences = tuple([old_sequences[i] for i in keep_indices])
+
+        # 2. Create a mapping from old index to new index
+        old_to_new_index = {
+            old_idx: new_idx for new_idx, old_idx in enumerate(keep_indices)
+        }
+
+        # 3. Filter and update bonds
+        old_bonds = self.sequences_obj.bonds
+        new_bonds = []
+        for bond in old_bonds:
+            if (
+                bond.chain_index_1 in old_to_new_index
+                and bond.chain_index_2 in old_to_new_index
+            ):
+                # Create a new Bond object with updated indices
+                new_bond = Bond(
+                    chain_index_1=old_to_new_index[bond.chain_index_1],
+                    res_id_1=bond.res_id_1,
+                    atom_name_1=bond.atom_name_1,
+                    chain_index_2=old_to_new_index[bond.chain_index_2],
+                    res_id_2=bond.res_id_2,
+                    atom_name_2=bond.atom_name_2,
+                    ori_chain_id_1=bond.ori_chain_id_1,
+                    ori_chain_id_2=bond.ori_chain_id_2,
+                )
+                new_bonds.append(new_bond)
+
+        return Sequences(
+            name=self.sequences_obj.name,
+            sequences=new_sequences,
+            bonds=tuple(new_bonds),
+        )
+
+    def remove_ligand(self) -> Sequences:
+        """
+        Remove all ligand sequences.
+        """
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type != LIGAND:
+                keep_indices.append(i)
+        return self._filter(keep_indices)
+
+    def remove_ion(self) -> Sequences:
+        """
+        Remove all ion sequences.
+        """
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type != LIGAND:
+                keep_indices.append(i)
+            else:
+                if (
+                    seq.ccd_codes
+                    and len(seq.ccd_codes) == 1
+                    and seq.ccd_codes[0] in IONS
+                ):
+                    # Is a ion
+                    continue
+                keep_indices.append(i)
+        return self._filter(keep_indices)
+
+    def remove_glycan(self) -> Sequences:
+        """
+        Remove all glycan sequences.
+        """
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type != LIGAND:
+                keep_indices.append(i)
+            else:
+                # Glycan usually is a ligand with multiple sugars or just a sugar
+                is_glycan = False
+                if seq.ccd_codes:
+                    # Check if all codes are glycans
+                    if all(code in GLYCANS for code in seq.ccd_codes):
+                        is_glycan = True
+
+                if not is_glycan:
+                    keep_indices.append(i)
+        return self._filter(keep_indices)
+
+    def remove_protein(self) -> Sequences:
+        """
+        Remove all protein sequences.
+        """
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type not in [PROTEIN, PROTEIN_D]:
+                keep_indices.append(i)
+        return self._filter(keep_indices)
+
+    def remove_dna(self) -> Sequences:
+        """
+        Remove all DNA sequences.
+        """
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type != DNA:
+                keep_indices.append(i)
+        return self._filter(keep_indices)
+
+    def remove_rna(self) -> Sequences:
+        """
+        Remove all RNA sequences.
+        """
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type != RNA:
+                keep_indices.append(i)
+        return self._filter(keep_indices)
+
+    def remove_covalent_ligand(self) -> Sequences:
+        """
+        Remove all covalent ligand sequences. A ligand is considered covalent if it
+        is involved in any explicit bond with a polymer chain.
+        """
+        # Find all ligand chain indices involved in bonds with a polymer chain
+        covalent_ligand_indices = set()
+        for bond in self.sequences_obj.bonds:
+            seq1 = self.sequences_obj.sequences[bond.chain_index_1]
+            seq2 = self.sequences_obj.sequences[bond.chain_index_2]
+            
+            if seq1.is_polymer() and not seq2.is_polymer():
+                covalent_ligand_indices.add(bond.chain_index_2)
+            elif seq2.is_polymer() and not seq1.is_polymer():
+                covalent_ligand_indices.add(bond.chain_index_1)
+
+        keep_indices = []
+        for i, seq in enumerate(self.sequences_obj.sequences):
+            if seq.entity_type != LIGAND:
+                keep_indices.append(i)
+            else:
+                if i not in covalent_ligand_indices:
+                    keep_indices.append(i)
+
+        return self._filter(keep_indices)

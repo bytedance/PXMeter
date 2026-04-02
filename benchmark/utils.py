@@ -437,7 +437,7 @@ def get_bootstrap_ci(
         bootstrap_result = stats.bootstrap(data, statistic, n_resamples=n)
 
         ci_lower, ci_upper = bootstrap_result.confidence_interval
-    return round(ci_lower, 4), round(ci_upper, 4)
+    return round(float(ci_lower), 4), round(float(ci_upper), 4)
 
 
 def get_binomial_ci(total_num: int, success_num: int) -> tuple[float, float]:
@@ -454,7 +454,7 @@ def get_binomial_ci(total_num: int, success_num: int) -> tuple[float, float]:
     """
     binomtest_result = stats.binomtest(success_num, total_num).proportion_ci(0.95)
     ci_lower, ci_upper = binomtest_result
-    return round(ci_lower, 4), round(ci_upper, 4)
+    return round(float(ci_lower), 4), round(float(ci_upper), 4)
 
 
 def add_cluster_id_to_df(

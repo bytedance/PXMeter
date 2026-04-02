@@ -27,6 +27,7 @@ from rdkit.Chem import rdFingerprintGenerator
 from rdkit.DataStructs import TanimotoSimilarity
 
 from pxmeter.configs.run_config import RUN_CONFIG
+from pxmeter.constants import DNA, DNA_RNA_HYBRID, PROTEIN, PROTEIN_D, RNA
 from pxmeter.data.ccd import get_ccd_mol_from_chain_atom_array
 from pxmeter.data.struct import Structure
 from pxmeter.data.utils import (
@@ -275,12 +276,35 @@ class MappingCIF:
         entity_score_dict = {}
         entity_alignments_dict = {}
 
+        # Check if model has PROTEIN_D or DNA_RNA_HYBRID
+        model_entity_types = set(model_struct.entity_poly_type.values())
+        model_has_protein_d = PROTEIN_D in model_entity_types
+        model_has_hybrid = DNA_RNA_HYBRID in model_entity_types
+
         for ref_id, ref_seq in ref_struct.entity_poly_seq.items():
             ref_type = ref_struct.entity_poly_type[ref_id]
             for model_id, model_seq in model_struct.entity_poly_seq.items():
                 model_type = model_struct.entity_poly_type[model_id]
 
-                if model_type != ref_type:
+                # Check if types match or if fallback is allowed
+                is_match = model_type == ref_type
+                if not is_match:
+                    # Protein D fallback: Ref is D, Model is L, and Model has no D
+                    if (
+                        ref_type == PROTEIN_D
+                        and model_type == PROTEIN
+                        and not model_has_protein_d
+                    ):
+                        is_match = True
+                    # Hybrid fallback: Ref is Hybrid, Model is DNA/RNA, and Model has no Hybrid
+                    elif (
+                        ref_type == DNA_RNA_HYBRID
+                        and model_type in (DNA, RNA)
+                        and not model_has_hybrid
+                    ):
+                        is_match = True
+
+                if not is_match:
                     continue
 
                 # Determine sequence type
@@ -1053,6 +1077,11 @@ class MappingResult:
                 chain_mapping,
                 chain_mapping_anchors,
             ) = chain_perm.get_heurisitic_chain_mapping()
+            if not chain_mapping:
+                raise ValueError(
+                    "Failed to find a valid chain mapping between the reference and model structures. "
+                    "This usually means the model does not match the reference sufficiently."
+                )
         else:
             chain_mapping_anchors = {}
 

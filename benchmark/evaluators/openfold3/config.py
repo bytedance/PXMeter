@@ -12,5 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-VALID_INPUT_TYPES = ["cif", "af3", "protenix", "boltz", "openfold3"]
-VALID_OUTPUT_TYPES = ["af3", "protenix", "boltz", "openfold3"]
+RANKER_KEYS = {
+    "complex": [
+        ("avg_plddt", False),
+        ("gpde", True),
+        ("iptm", False),
+        ("ptm", False),
+        ("sample_ranking_score", False),
+        ("has_clash", True),
+    ],
+    "chain": [
+        ("chain_ptm", False),
+    ],
+    "interface": [("chain_pair_iptm", False), ("bespoke_iptm", False)],
+}

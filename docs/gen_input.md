@@ -1,6 +1,6 @@
 # `pxm gen-input` Usage Guide
 
-`pxm gen-input` converts structural inputs across multiple formats—**mmCIF → AF3 / Protenix / Boltz**, **AF3 ←→ Protenix**, etc.
+`pxm gen-input` converts structural inputs across multiple formats—**mmCIF → AF3 / Protenix / Boltz / OpenFold3**, **AF3 ←→ Protenix**, etc.
 
 ---
 
@@ -10,8 +10,8 @@
 pxm gen-input \
   -i INPUT_PATH \
   -o OUTPUT_PATH \
-  -it cif|af3|protenix|boltz \
-  -ot af3|protenix|boltz \
+  -it cif|af3|protenix|boltz|openfold3 \
+  -ot af3|protenix|boltz|openfold3 \
   [--seeds "0,1,2" | --num-seeds 5] \
   [--assembly-id 1] \
   [--num-cpu 8]
@@ -23,10 +23,11 @@ Supported input types:
 * `af3` - AlphaFold3 JSON
 * `protenix` - Protenix JSON
 * `boltz` - Boltz YAML
+* `openfold3` - OpenFold3 JSON
 
 Supported output types:
 
-* `af3`, `protenix`, `boltz`
+* `af3`, `protenix`, `boltz`, `openfold3`
 
 The tool works on **single files** or **directories** (flat directory only).
 
@@ -60,7 +61,7 @@ pxm gen-input --interactive
 
 ## ⚙️ Key Arguments
 
-### Mandatory
+### 🟢 Required
 
 | Flag                 | Description              |
 | -------------------- | ------------------------ |
@@ -68,10 +69,20 @@ pxm gen-input --interactive
 | `-o, --output`       | Output file or directory |
 | `-it, --input-type`  | Input format             |
 | `-ot, --output-type` | Output format            |
-| `-p, --pdb-ids`      | Filter inputs by PDB IDs (comma-separated or file path) |
 
-**Input and output formats must differ.**
+**Input and output formats can be the same (e.g. for filtering/cleaning).**
 **File-to-file or dir-to-dir only.**
+
+---
+
+### 🟡 Optional
+
+| Flag                 | Description              |
+| -------------------- | ------------------------ |
+| `-p, --pdb-ids`      | Filter inputs by PDB IDs (comma-separated or file path) |
+| `-rm, --remove-entity-types` | Remove specific entities (comma-separated: ligand, ion, glycan, protein, dna, rna, covalent_ligand) |
+| `--keep_polymer_crosslinks` | Keep polymer-polymer crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list |
+| `--reassign-chain-id` | Reassign chain IDs, ignoring original ones from the input file. Default: Use original IDs. |
 
 ---
 
@@ -84,11 +95,11 @@ For **AlphaFold3** output, you must provide exactly one of:
 
 For **Protenix** output, seeds are optional. If not provided, an empty seed list will be used.
 
-**Boltz** output does not use seeds.
+**Boltz** and **OpenFold3** outputs do not use seeds.
 
 ---
 
-### CIF-specific options
+### CIF-specific options (Optional)
 
 | Flag            | Description                      |
 | --------------- | -------------------------------- |
@@ -96,10 +107,19 @@ For **Protenix** output, seeds are optional. If not provided, an empty seed list
 
 ---
 
-### Parallelism
+### Parallelism (Optional)
 
 `--num-cpu N`
 Number of workers (Joblib). `-1` uses all available CPUs.
+
+---
+
+### ⚠️ OpenFold3 Warnings
+Currently, **OpenFold3 does not support explicit covalent bonds via JSON inputs**. As a result, when generating an `openfold3` target format:
+- Any specified covalent bonds will be ignored.
+- Any covalent ligands (ligands or glycans that have explicit bonds to a polymer chain) will be automatically filtered out to prevent misleading the model. Non-covalent, fully detached ligands will still be retained.
+
+Additionally, **OpenFold3 does not support multiple CCD codes in a single ligand chain**. Entities containing more than one CCD code will be skipped and not included in the output JSON.
 
 ---
 
@@ -129,9 +149,9 @@ run_gen_input(
 
 Rules are the same as the CLI:
 
-* `input_type` / `output_type` must differ.
+* `input_type` / `output_type` can be the same (e.g. for filtering/cleaning).
 * For `output_type == "af3"`, you must provide **either** `seeds` **or** `num_seeds`.
-* For `output_type` in `{ "protenix", "boltz" }`, both `seeds` and `num_seeds` can be left as `None`.
+* For `output_type` in `{ "protenix", "boltz", "openfold3" }`, both `seeds` and `num_seeds` can be left as `None`.
 
 Example: Protenix → Boltz (no seeds needed):
 
@@ -227,36 +247,28 @@ pxm gen-input \
   -o boltz.yaml \
   -it cif -ot boltz
 ```
-t af3 \
-  --num-seeds 5 \
-  --assembly-id 1 \
-  --num-cpu 8
-```
 
-### AF3 → Protenix
+### Remove entities
 
-```bash
-pxm gen-input \
-  -i af3.json \
-  -o protenix.json \
-  -it af3 -ot protenix \
-  --seeds "0"
-```
-
-### Protenix → Boltz
-
-```bash
-pxm gen-input \
-  -i protenix.json \
-  -o boltz.yaml \
-  -it protenix -ot boltz
-```
-
-### mmCIF → Boltz
+You can remove specific entity types from the input during generation using `-rm` or `--remove-entity-types`.
+Supported types: `ligand`, `ion`, `glycan`, `protein`, `dna`, `rna`, `covalent_ligand`.
 
 ```bash
 pxm gen-input \
   -i structure.cif \
-  -o boltz.yaml \
-  -it cif -ot boltz
+  -o structure_no_ion_dna.json \
+  -it cif -ot protenix \
+  -rm ion,dna
+```
+
+### Keep polymer crosslinks
+
+By default, polymer-polymer crosslinks (like disulfide bonds) are filtered out. use `--keep_polymer_crosslinks` to keep them.
+
+```bash
+pxm gen-input \
+  -i structure.cif \
+  -o structure_with_crosslinks.json \
+  -it cif -ot protenix \
+  --keep_polymer_crosslinks
 ```

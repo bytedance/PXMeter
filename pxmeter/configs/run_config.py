@@ -33,12 +33,14 @@ RUN_CONFIG = ConfigDict(
             "calc_dockq": True,
             "calc_rmsd": True,
             "calc_pb_valid": True,
+            "calc_cdr_h3_bb_rmsd": False,
             "lddt": {
                 "eps": 1e-6,
                 "nucleotide_threshold": 30.0,
                 "non_nucleotide_threshold": 15.0,
                 "stereochecks": False,
                 "calc_backbone_lddt": True,
+                "calc_lddt_pli": True,
             },
             "dockq": {
                 "exclude_hetatms": True,

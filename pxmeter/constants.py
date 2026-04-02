@@ -17,6 +17,7 @@ PROTEIN = "polypeptide(L)"
 PROTEIN_D = "polypeptide(D)"
 DNA = "polydeoxyribonucleotide"
 RNA = "polyribonucleotide"
+DNA_RNA_HYBRID = "polydeoxyribonucleotide/polyribonucleotide hybrid"
 LIGAND = "ligand"  # non-polymer
 POLYMER = [PROTEIN, DNA, RNA]
 

@@ -1,3 +1,4 @@
+anarcii>=2.0.5
 biotite>=1.2.0
 gemmi==0.7.0
 joblib
@@ -5,7 +6,6 @@ ml_collections
 numpy
 pandas
 pdbeccdutils==0.8.5
-posebusters==0.3.1
 rdkit>=2024.09.6
 scipy
 tabulate

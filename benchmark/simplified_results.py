@@ -38,6 +38,8 @@ KEPT_RANKER = [
     "best.chains_ptm",
     "best.confidence_score",
     "best.pair_chains_iptm",
+    # openfold3
+    "best.bespoke_iptm",
 ]
 
 
@@ -56,6 +58,7 @@ EVAL_TYPE_MAP = {
     "DNA-RNA": "dna_rna",
     "DNA-Ligand": "dna_lig",
     "RNA-Ligand": "rna_lig",
+    "LDDT-PLI": "lddt_pli",
 }
 
 
@@ -166,8 +169,10 @@ def reduce_rmsd_csv(lddt_csv: Path | str) -> pd.DataFrame:
 
     metric_rename_map = {
         "lig_rmsd_sr": "Ligand RMSD SR",
+        "lig_rmsd_lddt_pli_sr": "Ligand SR",
         "pb_all_valid_sr": "PB Valid SR",
         "pb_all_valid_and_good_rmsd_sr": "PB Valid and Good RMSD SR",
+        "cdr_h3_bb_rmsd_sr": "CDR H3 RMSD SR",
     }
 
     available_metric_cols = [
@@ -200,15 +205,17 @@ def reduce_csv_content(
     dockq_csv: Path | str | None = None,
     lddt_csv: Path | str | None = None,
     rmsd_csv: Path | str | None = None,
+    cdr_h3_csv: Path | str | None = None,
     order: list[str] | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """
-    Reduce the content of DockQ, LDDT, and RMSD CSV files to a DataFrame and a formatted string.
+    Reduce the content of DockQ, LDDT, RMSD and CDR H3 CSV files to a DataFrame and a formatted string.
 
     Args:
         dockq_csv (Path or str): The path to the DockQ CSV file.
         lddt_csv (Path or str): The path to the LDDT CSV file.
         rmsd_csv (Path or str): The path to the RMSD CSV file.
+        cdr_h3_csv (Path or str): The path to the CDR H3 CSV file.
         order (list of str, optional): The order of rankers to be displayed in the DataFrame.
             Defaults to None.
 
@@ -216,8 +223,11 @@ def reduce_csv_content(
         tuple[pd.DataFrame, str]: A tuple containing the reduced DataFrame and a formatted string.
     """
     assert not (
-        dockq_csv is None and lddt_csv is None and rmsd_csv is None
-    ), "At least one of dockq_csv, lddt_csv, or rmsd_csv must be provided."
+        dockq_csv is None
+        and lddt_csv is None
+        and rmsd_csv is None
+        and cdr_h3_csv is None
+    ), "At least one of dockq_csv, lddt_csv, rmsd_csv or cdr_h3_csv must be provided."
 
     df_list = []
     if dockq_csv is not None and Path(dockq_csv).exists():
@@ -231,6 +241,10 @@ def reduce_csv_content(
     if rmsd_csv is not None and Path(rmsd_csv).exists():
         short_rmsd_df = reduce_rmsd_csv(rmsd_csv)
         df_list.append(short_rmsd_df)
+
+    if cdr_h3_csv is not None and Path(cdr_h3_csv).exists():
+        short_cdr_df = reduce_rmsd_csv(cdr_h3_csv)
+        df_list.append(short_cdr_df)
 
     total_df = df_list[0]
     for other_df in df_list[1:]:
@@ -257,6 +271,8 @@ def reduce_csv_content(
         "prot_prot DockQ SR",
         "prot_prot DockQ SR (Antibody=False)",
         "prot_prot DockQ SR (Antibody=True)",
+        "CDR H3 RMSD SR",
+        "Ligand SR",
         "dna_dna",
         "dna_lig",
         "dna_prot",
@@ -267,6 +283,7 @@ def reduce_csv_content(
         "intra_prot (Monomer)",
         "intra_rna",
         "prot_lig",
+        "lddt_pli",
         "prot_prot",
         "prot_prot (Antibody=False)",
         "prot_prot (Antibody=True)",
@@ -327,7 +344,11 @@ def rank_results_df(result_df: pd.DataFrame, metrics_col: str) -> pd.DataFrame:
     results = []
     for group, sub_df in result_df.groupby(group_cols):
         group_list = list(group)
-        sorted_sub_df = sub_df.sort_values(by=metrics_col, ascending=False)
+        sorted_sub_df = sub_df.dropna(subset=[metrics_col]).sort_values(
+            by=metrics_col, ascending=False
+        )
+        if sorted_sub_df.empty:
+            continue
         entry_id_num = sub_df["entry_id_num"].iloc[0]
         cluster_id_num = sub_df["cluster_num"].iloc[0]
 
@@ -349,6 +370,7 @@ def get_ranked_results(
     dockq_csv: Path | str | None = None,
     lddt_csv: Path | str | None = None,
     rmsd_csv: Path | str | None = None,
+    cdr_h3_csv: Path | str | None = None,
     output_csv: Path | str | None = None,
 ):
     """
@@ -362,6 +384,10 @@ def get_ranked_results(
         dockq_csv (Path | str | None): Path to a DockQ evaluation CSV file. If
         None or file does not exist, it is skipped.
         lddt_csv (Path | str | None): Path to an LDDT evaluation CSV file. If
+        None or file does not exist, it is skipped.
+        rmsd_csv (Path | str | None): Path to an RMSD evaluation CSV file. If
+        None or file does not exist, it is skipped.
+        cdr_h3_csv (Path | str | None): Path to a CDR H3 evaluation CSV file. If
         None or file does not exist, it is skipped.
         output_csv (Path | str | None): Path to the output CSV file containing
         ranked results. Must be provided if ranking results are to be saved.
@@ -384,14 +410,23 @@ def get_ranked_results(
 
         for metrics_col, metric_name in [
             ("lig_rmsd_sr", "Ligand_RMSD_SR"),
+            ("lig_rmsd_lddt_pli_sr", "Ligand_SR"),
             ("pb_all_valid_sr", "PB_Valid_SR"),
             ("pb_all_valid_and_good_rmsd_sr", "PB_Valid_and_Good_RMSD_SR"),
+            ("cdr_h3_bb_rmsd_sr", "CDR_H3_RMSD_SR"),
         ]:
             if metrics_col not in rmsd_df.columns:
                 continue
             ranked_rmsd_df = rank_results_df(rmsd_df, metrics_col=metrics_col)
             ranked_rmsd_df.insert(0, "metric", metric_name)
             df_list.append(ranked_rmsd_df)
+
+    if cdr_h3_csv is not None and Path(cdr_h3_csv).exists():
+        cdr_df = pd.read_csv(cdr_h3_csv)
+        if "cdr_h3_bb_rmsd_sr" in cdr_df.columns:
+            ranked_cdr_df = rank_results_df(cdr_df, metrics_col="cdr_h3_bb_rmsd_sr")
+            ranked_cdr_df.insert(0, "metric", "CDR_H3_RMSD_SR")
+            df_list.append(ranked_cdr_df)
 
     output_df = pd.concat(df_list)
     sorted_keys = [
@@ -409,12 +444,13 @@ def run_reduce(
     dockq_csv: Path | None = None,
     lddt_csv: Path | None = None,
     rmsd_csv: Path | None = None,
+    cdr_h3_csv: Path | None = None,
     order: list[str] | None = None,
 ):
     """
     Aggregate and summarize evaluation results, then produce ranked tables.
 
-    Reduces multiple evaluation result CSVs (DockQ, LDDT, RMSD) into a summary
+    Reduces multiple evaluation result CSVs (DockQ, LDDT, RMSD, CDR H3) into a summary
     table and corresponding ranked results. Writes both CSV and text summary
     files, as well as ranked results in CSV format.
 
@@ -426,10 +462,13 @@ def run_reduce(
         dockq_csv (Path | None): Optional path to DockQ evaluation CSV file.
         lddt_csv (Path | None): Optional path to LDDT evaluation CSV file.
         rmsd_csv (Path | None): Optional path to RMSD evaluation CSV file.
+        cdr_h3_csv (Path | None): Optional path to CDR H3 evaluation CSV file.
         order (list[str] | None): Optional list of dataset names to order the
             summary table. If None, default ordering is used.
     """
-    table_df, table_str = reduce_csv_content(dockq_csv, lddt_csv, rmsd_csv, order=order)
+    table_df, table_str = reduce_csv_content(
+        dockq_csv, lddt_csv, rmsd_csv, cdr_h3_csv, order=order
+    )
 
     output_summary_csv.parent.mkdir(exist_ok=True, parents=True)
     table_df.to_csv(
@@ -443,7 +482,9 @@ def run_reduce(
         f.write(table_str)
 
     output_ranked_csv.parent.mkdir(exist_ok=True, parents=True)
-    get_ranked_results(dockq_csv, lddt_csv, rmsd_csv, output_csv=output_ranked_csv)
+    get_ranked_results(
+        dockq_csv, lddt_csv, rmsd_csv, cdr_h3_csv, output_csv=output_ranked_csv
+    )
 
 
 if __name__ == "__main__":
