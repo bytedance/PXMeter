@@ -938,7 +938,10 @@ def _prepare_tasks(
                     sub_metrics_df["seed"].isin(set(dataset_seeds))
                 ].copy()
 
-            remain_seeds = sorted(list(sub_metrics_df["seed"].unique()), key=int)
+            remain_seeds = sorted(
+                [str(s) for s in sub_metrics_df["seed"].unique()],
+                key=lambda s: (not s.isdigit(), int(s) if s.isdigit() else s),
+            )
             logging.info(
                 '%d entries after filtering from "%s" by %d seeds: [%s]\n',
                 sub_metrics_df["entry_id"].nunique(),

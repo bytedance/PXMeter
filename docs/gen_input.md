@@ -263,7 +263,7 @@ pxm gen-input \
 
 ### Keep polymer crosslinks
 
-By default, polymer-polymer crosslinks (like disulfide bonds) are filtered out. use `--keep_polymer_crosslinks` to keep them.
+By default, polymer-polymer crosslinks (like disulfide bonds) are filtered out. Use `--keep_polymer_crosslinks` to keep them.
 
 ```bash
 pxm gen-input \

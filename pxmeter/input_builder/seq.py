@@ -445,7 +445,7 @@ class Sequences:
                     structure, entity_id, res_id_and_name
                 )
                 # Update entity type in structure
-                structure[entity_id] = entity_type
+                structure.entity_poly_type[entity_id] = entity_type
 
             target_std_residues = Sequences._get_std_residues(entity_type)
 
@@ -790,7 +790,7 @@ class SequencesFilter:
         for bond in self.sequences_obj.bonds:
             seq1 = self.sequences_obj.sequences[bond.chain_index_1]
             seq2 = self.sequences_obj.sequences[bond.chain_index_2]
-            
+
             if seq1.is_polymer() and not seq2.is_polymer():
                 covalent_ligand_indices.add(bond.chain_index_2)
             elif seq2.is_polymer() and not seq1.is_polymer():

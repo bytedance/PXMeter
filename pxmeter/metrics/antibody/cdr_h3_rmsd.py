@@ -92,7 +92,7 @@ def calc_cdr_h3_bb_rmsd(
 
         # Filter: Only Heavy chains with CDR3
         # ANARCII not supported scFv currently (v2.0.2)
-        if chain_type != "H" or "CDR3" not in ref_regions_full:
+        if ("H" not in chain_type) or ("CDR3" not in ref_regions_full):
             continue
 
         # Extract ALL atoms for this chain

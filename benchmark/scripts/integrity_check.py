@@ -26,7 +26,7 @@ def run_integrity_check(metrics_file: Path, output_csv: Path = None):
     Check the integrity of the seeds and samples in the metrics file.
 
     Args:
-        metrics_csv: The path to the metrics file.
+        metrics_file: The path to the metrics file.
         output_csv: The path to the output csv file.
                     If None, the output will be printed to the console.
     """

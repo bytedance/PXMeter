@@ -322,7 +322,7 @@ def update():
 @click.option(
     "--keep_polymer_crosslinks",
     is_flag=True,
-    help="Keep polymer-polymer crosslinks (e.g. (e.g. disulfide bonds, cyclic-peptides)) in the bonds list.",
+    help="Keep polymer-polymer crosslinks (e.g. disulfide bonds, cyclic-peptides) in the bonds list.",
 )
 @click.option(
     "-rm",
