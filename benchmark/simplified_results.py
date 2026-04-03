@@ -201,10 +201,55 @@ def reduce_rmsd_csv(lddt_csv: Path | str) -> pd.DataFrame:
     return new_sub_df
 
 
+def reduce_others_csv(others_csv: Path | str) -> pd.DataFrame:
+    """
+    Reduce the Others CSV file to a DataFrame with selected columns and renamed columns.
+
+    Args:
+        others_csv (Path or str): The path to the Others CSV file.
+
+    Returns:
+        pd.DataFrame: The reduced DataFrame with selected columns and renamed columns.
+    """
+    df = pd.read_csv(others_csv)
+
+    sub_df = df[df["ranker"].isin(KEPT_RANKER)].copy()
+
+    metric_rename_map = {
+        "lig_rmsd_lddt_pli_sr": "Ligand SR",
+    }
+
+    available_metric_cols = [
+        col for col in metric_rename_map.keys() if col in sub_df.columns
+    ]
+    available_metric_rename = {
+        col: metric_rename_map[col] for col in available_metric_cols
+    }
+
+    base_cols = ["name", "ranker"]
+    sub_df = sub_df[base_cols + available_metric_cols].copy()
+    new_sub_df = sub_df.rename(columns=available_metric_rename)
+
+    num_cols = new_sub_df.select_dtypes(include="number").columns
+    if len(num_cols) > 0:
+        new_sub_df[num_cols] = new_sub_df[num_cols].round(4)
+
+    entry_cluster = f"{df['entry_id_num'].iloc[0]}/{df['cluster_num'].iloc[0]}"
+
+    summary_row = {"name": "entry_id_num/cluster_num"}
+    for pretty_name in available_metric_rename.values():
+        summary_row[pretty_name] = entry_cluster
+
+    header_df = pd.DataFrame([summary_row], columns=new_sub_df.columns)
+    new_sub_df = pd.concat([header_df, new_sub_df], ignore_index=True)
+    return new_sub_df
+
+
 def reduce_csv_content(
     dockq_csv: Path | str | None = None,
     lddt_csv: Path | str | None = None,
     rmsd_csv: Path | str | None = None,
+    others_csv: Path | str | None = None,
     cdr_h3_csv: Path | str | None = None,
     order: list[str] | None = None,
 ) -> tuple[pd.DataFrame, str]:
@@ -226,8 +271,9 @@ def reduce_csv_content(
         dockq_csv is None
         and lddt_csv is None
         and rmsd_csv is None
+        and others_csv is None
         and cdr_h3_csv is None
-    ), "At least one of dockq_csv, lddt_csv, rmsd_csv or cdr_h3_csv must be provided."
+    ), "At least one of dockq_csv, lddt_csv, rmsd_csv, others_csv or cdr_h3_csv must be provided."
 
     df_list = []
     if dockq_csv is not None and Path(dockq_csv).exists():
@@ -241,6 +287,10 @@ def reduce_csv_content(
     if rmsd_csv is not None and Path(rmsd_csv).exists():
         short_rmsd_df = reduce_rmsd_csv(rmsd_csv)
         df_list.append(short_rmsd_df)
+
+    if others_csv is not None and Path(others_csv).exists():
+        short_others_df = reduce_others_csv(others_csv)
+        df_list.append(short_others_df)
 
     if cdr_h3_csv is not None and Path(cdr_h3_csv).exists():
         short_cdr_df = reduce_rmsd_csv(cdr_h3_csv)
@@ -370,6 +420,7 @@ def get_ranked_results(
     dockq_csv: Path | str | None = None,
     lddt_csv: Path | str | None = None,
     rmsd_csv: Path | str | None = None,
+    others_csv: Path | str | None = None,
     cdr_h3_csv: Path | str | None = None,
     output_csv: Path | str | None = None,
 ):
@@ -410,7 +461,6 @@ def get_ranked_results(
 
         for metrics_col, metric_name in [
             ("lig_rmsd_sr", "Ligand_RMSD_SR"),
-            ("lig_rmsd_lddt_pli_sr", "Ligand_SR"),
             ("pb_all_valid_sr", "PB_Valid_SR"),
             ("pb_all_valid_and_good_rmsd_sr", "PB_Valid_and_Good_RMSD_SR"),
             ("cdr_h3_bb_rmsd_sr", "CDR_H3_RMSD_SR"),
@@ -420,6 +470,18 @@ def get_ranked_results(
             ranked_rmsd_df = rank_results_df(rmsd_df, metrics_col=metrics_col)
             ranked_rmsd_df.insert(0, "metric", metric_name)
             df_list.append(ranked_rmsd_df)
+
+    if others_csv is not None and Path(others_csv).exists():
+        others_df = pd.read_csv(others_csv)
+
+        for metrics_col, metric_name in [
+            ("lig_rmsd_lddt_pli_sr", "Ligand_SR"),
+        ]:
+            if metrics_col not in others_df.columns:
+                continue
+            ranked_others_df = rank_results_df(others_df, metrics_col=metrics_col)
+            ranked_others_df.insert(0, "metric", metric_name)
+            df_list.append(ranked_others_df)
 
     if cdr_h3_csv is not None and Path(cdr_h3_csv).exists():
         cdr_df = pd.read_csv(cdr_h3_csv)
@@ -444,6 +506,7 @@ def run_reduce(
     dockq_csv: Path | None = None,
     lddt_csv: Path | None = None,
     rmsd_csv: Path | None = None,
+    others_csv: Path | None = None,
     cdr_h3_csv: Path | None = None,
     order: list[str] | None = None,
 ):
@@ -467,7 +530,7 @@ def run_reduce(
             summary table. If None, default ordering is used.
     """
     table_df, table_str = reduce_csv_content(
-        dockq_csv, lddt_csv, rmsd_csv, cdr_h3_csv, order=order
+        dockq_csv, lddt_csv, rmsd_csv, others_csv, cdr_h3_csv, order=order
     )
 
     output_summary_csv.parent.mkdir(exist_ok=True, parents=True)
@@ -483,7 +546,12 @@ def run_reduce(
 
     output_ranked_csv.parent.mkdir(exist_ok=True, parents=True)
     get_ranked_results(
-        dockq_csv, lddt_csv, rmsd_csv, cdr_h3_csv, output_csv=output_ranked_csv
+        dockq_csv,
+        lddt_csv,
+        rmsd_csv,
+        others_csv,
+        cdr_h3_csv,
+        output_csv=output_ranked_csv,
     )
 
 
@@ -492,6 +560,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dockq_csv", type=Path, default=None)
     parser.add_argument("-l", "--lddt_csv", type=Path, default=None)
     parser.add_argument("-r", "--rmsd_csv", type=Path, default=None)
+    parser.add_argument("-c", "--others_csv", type=Path, default=None)
     parser.add_argument("-o", "--output_path", type=Path, default=".")
     parser.add_argument("-n", "--out_file_name", type=str, default="Summary_table")
     args = parser.parse_args()
@@ -504,4 +573,5 @@ if __name__ == "__main__":
         dockq_csv=args.dockq_csv,
         lddt_csv=args.lddt_csv,
         rmsd_csv=args.rmsd_csv,
+        others_csv=args.others_csv,
     )

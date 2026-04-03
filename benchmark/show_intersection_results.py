@@ -405,6 +405,7 @@ def _compute_metric_results(
             results_lists["lddt"].append(res)
             details_lists["lddt"].append(det)
 
+        elif metric == "lddt_pli":
             # Check if lddt_pli column exists and compute it using ChainInterfaceDisplayer
             if "lddt_pli" in valid_chain_displayer.metrics_df.columns:
                 res_pli, det_pli = valid_chain_displayer.get_lddt_pli(
@@ -422,25 +423,12 @@ def _compute_metric_results(
                     subset_name=subset_name,
                 )
 
-                res_combined = rmsd_displayer.get_ligand_combined_metrics(
+                res_others = rmsd_displayer.get_ligand_others_metrics(
                     mask_on_metrics_df=mask_valid,
                     subset_name=subset_name,
                 )
-                if not res_combined.empty:
-                    if not res.empty:
-                        cols_to_use = [
-                            c
-                            for c in res_combined.columns
-                            if c not in ["entry_id_num", "cluster_num"]
-                        ]
-                        res = pd.merge(
-                            res,
-                            res_combined[cols_to_use],
-                            on=["ranker", "subset"],
-                            how="outer",
-                        )
-                    else:
-                        res = res_combined
+                if not res_others.empty:
+                    results_lists["others"].append(res_others)
 
                 results_lists["rmsd"].append(res)
                 details_lists["rmsd"].append(det)
@@ -602,10 +590,13 @@ def _get_a_dataset_result(
         )
 
     metric_results = {}
-    for metric_name in ["dockq", "lddt", "rmsd"]:
+    for metric_name in ["dockq", "lddt", "rmsd", "others"]:
         if results_lists[metric_name]:
             result_df = pd.concat(results_lists[metric_name])
-            details_df = pd.concat(details_lists[metric_name])
+            if details_lists[metric_name]:
+                details_df = pd.concat(details_lists[metric_name])
+            else:
+                details_df = pd.DataFrame()
 
             if not result_df.empty:
                 result_df.insert(0, "name", dataset_name)
@@ -624,6 +615,7 @@ def _save_to_output_csv(
     dockq_results: list[pd.DataFrame],
     lddt_results: list[pd.DataFrame],
     rmsd_results: list[pd.DataFrame],
+    others_results: list[pd.DataFrame],
     dockq_details: list[pd.DataFrame],
     lddt_details: list[pd.DataFrame],
     rmsd_details: list[pd.DataFrame],
@@ -631,6 +623,7 @@ def _save_to_output_csv(
     dockq_csv = None
     lddt_csv = None
     rmsd_csv = None
+    others_csv = None
 
     if len(dockq_results) > 0:
         all_dockq_df = pd.concat(dockq_results)
@@ -713,7 +706,45 @@ def _save_to_output_csv(
                 quoting=csv.QUOTE_NONNUMERIC,
             )
             logging.info("RMSD details saved to %s", rmsd_details_csv)
-    return dockq_csv, lddt_csv, rmsd_csv
+
+    if len(others_results) > 0:
+        all_others_df = pd.concat(others_results)
+        if len(all_others_df) > 0:
+            others_csv = output_dir / "Others_results.csv"
+            cols_to_float = ["lig_rmsd_lddt_pli_sr"]
+            for col in cols_to_float:
+                if col in all_others_df.columns:
+                    all_others_df[col] = all_others_df[col].astype(float)
+
+            all_others_df = all_others_df.round(4)
+
+            # Ensure consistent column ordering like other results files
+            # Preferred order: name, eval_dataset, eval_type (if exists), entry_id_num, cluster_num, ranker, metrics, subset
+            base_cols = ["name", "eval_dataset"]
+            if "eval_type" in all_others_df.columns:
+                base_cols.append("eval_type")
+            base_cols.extend(["entry_id_num", "cluster_num", "ranker"])
+
+            end_cols = ["subset"]
+            metrics_cols = [
+                c
+                for c in all_others_df.columns
+                if c not in base_cols and c not in end_cols
+            ]
+
+            ordered_cols = base_cols + metrics_cols + end_cols
+            # Reorder with available columns to be safe
+            ordered_cols = [c for c in ordered_cols if c in all_others_df.columns]
+            all_others_df = all_others_df[ordered_cols]
+
+            all_others_df.to_csv(
+                others_csv,
+                index=False,
+                quoting=csv.QUOTE_NONNUMERIC,
+            )
+            logging.info("Others results saved to %s", others_csv)
+
+    return dockq_csv, lddt_csv, rmsd_csv, others_csv
 
 
 def _integrity_check(
@@ -823,11 +854,11 @@ def _prepare_tasks(
                     )
                     dfs_to_concat.append(metrics_df)
 
-                combined_df = pd.concat(dfs_to_concat, ignore_index=True)
-                filepath_to_df[metrics_files] = combined_df
+                others_df = pd.concat(dfs_to_concat, ignore_index=True)
+                filepath_to_df[metrics_files] = others_df
                 logging.info(
                     "%s entries loaded from '%s'\n",
-                    combined_df["entry_id"].nunique(),
+                    others_df["entry_id"].nunique(),
                     ", ".join([str(p) for p in metrics_files]),
                 )
 
@@ -1017,6 +1048,7 @@ def save_all_results(
     dockq_results = []
     lddt_results = []
     rmsd_results = []
+    others_results = []
 
     dockq_details = []
     lddt_details = []
@@ -1032,20 +1064,23 @@ def save_all_results(
             elif metric_name == "rmsd":
                 rmsd_results.append(result_df)
                 rmsd_details.append(details_df)
+            elif metric_name == "others":
+                others_results.append(result_df)
             else:
                 raise NotImplementedError(f"Unknown metric type {metric_name}")
 
     # Save results to CSV files
-    dockq_csv, lddt_csv, rmsd_csv = _save_to_output_csv(
+    dockq_csv, lddt_csv, rmsd_csv, others_csv = _save_to_output_csv(
         output_dir,
         dockq_results,
         lddt_results,
         rmsd_results,
+        others_results,
         dockq_details,
         lddt_details,
         rmsd_details,
     )
-    return dockq_csv, lddt_csv, rmsd_csv
+    return dockq_csv, lddt_csv, rmsd_csv, others_csv
 
 
 def get_intersection_results(
@@ -1084,7 +1119,7 @@ def get_intersection_results(
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     gen_aggregated_results(eval_info_dict, trials, num_cpu=num_cpu, overwrite=overwrite)
-    dockq_csv, lddt_csv, rmsd_csv = save_all_results(
+    dockq_csv, lddt_csv, rmsd_csv, others_csv = save_all_results(
         eval_info_dict,
         trials,
         output_dir=output_dir,
@@ -1092,7 +1127,7 @@ def get_intersection_results(
         subset_csv=subset_csv,
         num_cpu=num_cpu,
     )
-    return dockq_csv, lddt_csv, rmsd_csv
+    return dockq_csv, lddt_csv, rmsd_csv, others_csv
 
 
 def run(
@@ -1134,7 +1169,7 @@ def run(
     else:
         pdb_id_list = None
 
-    dockq_csv, lddt_csv, rmsd_csv = get_intersection_results(
+    dockq_csv, lddt_csv, rmsd_csv, others_csv = get_intersection_results(
         eval_info_dict,
         trials,
         output_dir=output_path,
@@ -1152,6 +1187,7 @@ def run(
         dockq_csv,
         lddt_csv,
         rmsd_csv,
+        others_csv,
         order=trials,
     )
 

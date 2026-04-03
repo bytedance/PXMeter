@@ -1021,15 +1021,15 @@ class RMSDDisplayer:
         rmsd_details_df["subset"] = subset_name
         return rmsd_results_df, rmsd_details_df
 
-    def get_ligand_combined_metrics(
+    def get_ligand_others_metrics(
         self,
         mask_on_metrics_df: Sequence[bool] | None = None,
         subset_name: str = "All",
     ) -> pd.DataFrame:
         """
-        Calculate combined metrics for ligand predictions directly from metrics dataframe.
+        Calculate others metrics for ligand predictions directly from metrics dataframe.
 
-        The combined metric is the success rate of (lig_rmsd < 2.0 AND lddt_pli > 0.8).
+        The others metric is the success rate of (lig_rmsd < 2.0 AND lddt_pli > 0.8).
         It is calculated by averaging the success flags across all samples (not aggregated by cluster).
 
         Args:
@@ -1079,7 +1079,7 @@ class RMSDDisplayer:
                 ranker_lookup[f"best.{rk}"] = asc
 
         for agg_func_name in ranker_names:
-            combined_success_flags = []
+            others_success_flags = []
 
             group_by_key = ["entry_id", "chain_id_1"]
             selected_df = self._select_representative_samples(
@@ -1090,14 +1090,14 @@ class RMSDDisplayer:
                 flags = (
                     (selected_df["lig_rmsd"] < 2.0) & (selected_df["lddt_pli"] > 0.8)
                 ).astype(int)
-                combined_success_flags = flags.tolist()
+                others_success_flags = flags.tolist()
             else:
-                combined_success_flags = [0] * len(selected_df)
+                others_success_flags = [0] * len(selected_df)
 
-            if not combined_success_flags:
+            if not others_success_flags:
                 continue
 
-            sr = np.mean(combined_success_flags)
+            sr = np.mean(others_success_flags)
             results.append(
                 {
                     "ranker": agg_func_name,
@@ -1105,7 +1105,7 @@ class RMSDDisplayer:
                     "subset": subset_name,
                     "entry_id_num": len(rmsd_df["entry_id"].unique()),
                     "cluster_num": len(
-                        combined_success_flags
+                        others_success_flags
                     ),  # Calculated per case (entry+chain)
                 }
             )
