@@ -174,6 +174,8 @@ class RMSDMetrics:
                 rmsd_mask=ligand_mask,
                 reduce=True,
                 allow_reflection=False,
+                src_valid_mask=self.model_struct.valid_mask,
+                tar_valid_mask=self.ref_struct.valid_mask,
             )
             rmsd_result_dict[ref_lig_chain_id] = {
                 "ref_pocket_chain": ref_pocket_chain_id,

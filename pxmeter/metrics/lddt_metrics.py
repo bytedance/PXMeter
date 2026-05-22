@@ -61,6 +61,15 @@ class LDDT:
             self._get_model_stereo_valid_atom_mask() if stereochecks else None
         )
 
+        # Add valid_mask from model_struct to model_atom_mask
+        if self.model_struct.valid_mask is not None:
+            if self.model_atom_mask is not None:
+                self.model_atom_mask = (
+                    self.model_atom_mask & self.model_struct.valid_mask
+                )
+            else:
+                self.model_atom_mask = self.model_struct.valid_mask.copy()
+
         self.lddt_atom_pair = self.compute_lddt_atom_pair()
 
         model_dist_all, ref_dist_all = self._calc_sparse_dist(

@@ -70,6 +70,13 @@ def compute_pb_valid(
         model_lig_atom_array.res_name = ref_lig_atom_array.res_name
         model_cond_atom_array = model_struct.atom_array[~lig_mask].copy()
 
+        if model_struct.valid_mask is not None:
+            model_cond_valid_mask = model_struct.valid_mask[~lig_mask].copy()
+            model_lig_valid_mask = model_struct.valid_mask[lig_mask].copy()
+        else:
+            model_cond_valid_mask = None
+            model_lig_valid_mask = None
+
         ref_lig_mol = get_ccd_mol_from_chain_atom_array(ref_lig_atom_array)
         model_lig_mol = get_ccd_mol_from_chain_atom_array(model_lig_atom_array)
 
@@ -77,6 +84,8 @@ def compute_pb_valid(
             mol_pred=model_lig_mol,
             mol_true=ref_lig_mol,
             mol_cond=model_cond_atom_array,
+            mol_cond_valid_mask=model_cond_valid_mask,
+            mol_pred_valid_mask=model_lig_valid_mask,
         )
 
         # record ligand chain id

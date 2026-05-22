@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import biotite.structure as struc
 import numpy as np
 import pandas as pd
@@ -71,12 +73,58 @@ def biotite_to_rdkit_fast(atom_array):
     return mol.GetMol()
 
 
-def run_pb_valid(mol_pred, mol_true, mol_cond):
+def run_pb_valid(
+    mol_pred: Chem.Mol,
+    mol_true: Chem.Mol,
+    mol_cond: struc.AtomArray,
+    mol_cond_valid_mask: Optional[np.ndarray] = None,
+    mol_pred_valid_mask: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
     """
-    mol_pred: RDKit Mol (model_lig_mol)
-    mol_true: RDKit Mol (ref_lig_mol)
-    mol_cond: Biotite AtomArray (model_cond_atom_array)
+    Run pose-busting valid check.
+
+    Args:
+        mol_pred (Chem.Mol): Predicted ligand RDKit molecule
+        mol_true (Chem.Mol): True ligand RDKit molecule
+        mol_cond (AtomArray): Conditioner receptor Biotite AtomArray
+        mol_cond_valid_mask (np.ndarray): Boolean mask indicating valid atoms in mol_cond
+        mol_pred_valid_mask (np.ndarray): Boolean mask indicating valid atoms in mol_pred
+
+    Returns:
+        pd.DataFrame: DataFrame containing pose-busting valid results
     """
+    # handle unmapped coordinates in mol_cond (from penalize_unmapped_reference_atoms)
+    if mol_cond_valid_mask is not None:
+        if not np.all(mol_cond_valid_mask):
+            mol_cond = mol_cond[mol_cond_valid_mask]
+
+    coords_pred = mol_pred.GetConformer().GetPositions()
+    if mol_pred_valid_mask is not None:
+        if not np.all(mol_pred_valid_mask):
+            # Return invalid PB result if the ligand has missing atoms
+            cols = [
+                "mol_pred_loaded",
+                "mol_true_loaded",
+                "mol_cond_loaded",
+                "sanitization",
+                "inchi_convertible",
+                "all_atoms_connected",
+                "molecular_formula",
+                "molecular_bonds",
+                "double_bond_stereochemistry",
+                "tetrahedral_chirality",
+                "protein-ligand_maximum_distance",
+                "minimum_distance_to_protein",
+                "minimum_distance_to_organic_cofactors",
+                "minimum_distance_to_inorganic_cofactors",
+                "minimum_distance_to_waters",
+                "internal_steric_clash",
+                "aromatic_ring_flatness",
+                "double_bond_flatness",
+                "internal_energy",
+            ]
+            return pd.DataFrame({k: [False] for k in cols})
+
     # Suppress RDKit logs locally to handle multi-processing workers
     from rdkit import RDLogger
 

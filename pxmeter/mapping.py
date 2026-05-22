@@ -1090,12 +1090,150 @@ class MappingResult:
             chain_perm_model_indices,
         ) = chain_perm.get_permuted_indices(chain_mapping)
 
+        if mapping_config.get("penalize_unmapped_reference_atoms", False):
+            # Include ALL reference atoms, even those from completely unmapped chains
+            ref_all_indices = np.arange(len(map_cif.ref_struct.uni_chain_id))
+            missing_ref_indices = np.setdiff1d(
+                ref_all_indices, chain_perm_ref_indices, assume_unique=True
+            )
+
+            if len(missing_ref_indices) > 0:
+                combined_ref_indices = np.concatenate(
+                    [chain_perm_ref_indices, missing_ref_indices]
+                )
+                combined_model_indices = np.concatenate(
+                    [
+                        chain_perm_model_indices,
+                        np.full(len(missing_ref_indices), -1, dtype=int),
+                    ]
+                )
+                sort_idx = np.argsort(combined_ref_indices)
+                chain_perm_ref_indices = combined_ref_indices[sort_idx]
+                chain_perm_model_indices = combined_model_indices[sort_idx]
+
         chain_permed_ref_struct = map_cif.ref_struct.select_substructure(
             chain_perm_ref_indices
         )
-        chain_permed_model_struct = map_cif.model_struct.select_substructure(
-            chain_perm_model_indices
-        )
+
+        # Build chain_permed_model_struct handling -1
+        valid_model_mask = chain_perm_model_indices != -1
+        if not np.all(valid_model_mask):
+            new_model_array = AtomArray(len(chain_perm_model_indices))
+            for annot in map_cif.model_struct.atom_array.get_annotation_categories():
+                m_dtype = map_cif.model_struct.atom_array.get_annotation(annot).dtype
+                if (
+                    annot
+                    in chain_permed_ref_struct.atom_array.get_annotation_categories()
+                ):
+                    r_dtype = chain_permed_ref_struct.atom_array.get_annotation(
+                        annot
+                    ).dtype
+                    dtype = np.promote_types(m_dtype, r_dtype)
+                else:
+                    dtype = m_dtype
+                padded_annot = np.zeros(len(chain_perm_model_indices), dtype=dtype)
+                padded_annot[
+                    valid_model_mask
+                ] = map_cif.model_struct.atom_array.get_annotation(annot)[
+                    chain_perm_model_indices[valid_model_mask]
+                ]
+                # Fill dummy annotations to match reference
+                # Note: Dummy atoms are primarily intended to be ignored via `valid_mask=False`.
+                # We copy annotations here to prevent downstream filtering logic (which might ignore valid_mask)
+                # from misidentifying dummy atoms.
+                if (
+                    annot
+                    in chain_permed_ref_struct.atom_array.get_annotation_categories()
+                ):
+                    padded_annot[
+                        ~valid_model_mask
+                    ] = chain_permed_ref_struct.atom_array.get_annotation(annot)[
+                        ~valid_model_mask
+                    ]
+                new_model_array.set_annotation(annot, padded_annot)
+
+            new_model_array.coord[:] = 0.0
+            new_model_array.coord[
+                valid_model_mask
+            ] = map_cif.model_struct.atom_array.coord[
+                chain_perm_model_indices[valid_model_mask]
+            ]
+
+            new_uni_chain_id = np.empty(
+                len(chain_perm_model_indices),
+                dtype=np.promote_types(
+                    map_cif.model_struct.uni_chain_id.dtype,
+                    chain_permed_ref_struct.uni_chain_id.dtype,
+                ),
+            )
+            new_uni_chain_id[valid_model_mask] = map_cif.model_struct.uni_chain_id[
+                chain_perm_model_indices[valid_model_mask]
+            ]
+            if chain_mapping:
+                ref_uc_sample = next(iter(chain_mapping.keys()))
+                assert (
+                    ref_uc_sample in map_cif.ref_struct.uni_chain_id
+                ), "chain_mapping must map ref uni_chain_id to model uni_chain_id"
+
+            for i in np.where(~valid_model_mask)[0]:
+                ref_uc = chain_permed_ref_struct.uni_chain_id[i]
+                new_uni_chain_id[i] = chain_mapping.get(ref_uc, ref_uc)
+
+            new_uni_atom_id = np.empty(
+                len(chain_perm_model_indices),
+                dtype=np.promote_types(
+                    map_cif.model_struct.uni_atom_id.dtype,
+                    chain_permed_ref_struct.uni_atom_id.dtype,
+                ),
+            )
+            new_uni_atom_id[valid_model_mask] = map_cif.model_struct.uni_atom_id[
+                chain_perm_model_indices[valid_model_mask]
+            ]
+            new_uni_atom_id[~valid_model_mask] = chain_permed_ref_struct.uni_atom_id[
+                ~valid_model_mask
+            ]
+
+            new_valid_mask = np.zeros(len(chain_perm_model_indices), dtype=bool)
+            new_valid_mask[valid_model_mask] = True
+            if map_cif.model_struct.valid_mask is not None:
+                new_valid_mask[valid_model_mask] &= map_cif.model_struct.valid_mask[
+                    chain_perm_model_indices[valid_model_mask]
+                ]
+
+            if map_cif.model_struct.atom_array.bonds is not None:
+                old_to_new = np.full(
+                    len(map_cif.model_struct.atom_array), -1, dtype=int
+                )
+                old_to_new[chain_perm_model_indices[valid_model_mask]] = np.where(
+                    valid_model_mask
+                )[0]
+
+                old_bonds = map_cif.model_struct.atom_array.bonds.as_array()
+                mask = (old_to_new[old_bonds[:, 0]] != -1) & (
+                    old_to_new[old_bonds[:, 1]] != -1
+                )
+                valid_old_bonds = old_bonds[mask]
+
+                new_bonds = valid_old_bonds.copy()
+                if len(new_bonds) > 0:
+                    new_bonds[:, 0] = old_to_new[valid_old_bonds[:, 0]]
+                    new_bonds[:, 1] = old_to_new[valid_old_bonds[:, 1]]
+
+                new_model_array.bonds = type(map_cif.model_struct.atom_array.bonds)(
+                    len(chain_perm_model_indices), new_bonds
+                )
+
+            chain_permed_model_struct = dataclasses.replace(
+                map_cif.model_struct,
+                atom_array=new_model_array,
+                uni_chain_id=new_uni_chain_id,
+                uni_atom_id=new_uni_atom_id,
+                valid_mask=new_valid_mask,
+            )
+        else:
+            chain_permed_model_struct = map_cif.model_struct.select_substructure(
+                chain_perm_model_indices
+            )
 
         residue_perm = ResiduePermutation(
             chain_permed_ref_struct,

@@ -158,45 +158,70 @@ def _get_paired_backbone_coords(
     indices1: list[tuple[int, int]],
     indices2: list[tuple[int, int]],
     align_atoms: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+
     """
     Get paired backbone coordinates for two lists of aligned residues.
     Ensures that ONLY common backbone atoms are selected in the SAME order.
     If align_atoms is False, assumes the atoms in res_list1 and res_list2 are already aligned.
     """
+
     coords1 = []
     coords2 = []
+    valid1 = []
+    valid2 = []
 
     atom_names1 = struct1.atom_array.atom_name
     coords1_all = struct1.atom_array.coord
+    valid1_all = (
+        struct1.valid_mask
+        if struct1.valid_mask is not None
+        else np.ones(len(coords1_all), dtype=bool)
+    )
+
     atom_names2 = struct2.atom_array.atom_name
     coords2_all = struct2.atom_array.coord
+    valid2_all = (
+        struct2.valid_mask
+        if struct2.valid_mask is not None
+        else np.ones(len(coords2_all), dtype=bool)
+    )
 
     for (s1, e1), (s2, e2) in zip(indices1, indices2):
         n1 = atom_names1[s1:e1]
         n2 = atom_names2[s2:e2]
         c1 = coords1_all[s1:e1]
         c2 = coords2_all[s2:e2]
+        v1 = valid1_all[s1:e1]
+        v2 = valid2_all[s2:e2]
 
         if align_atoms:
-            # Create mapping for fast lookup
             name_to_idx1 = {name: i for i, name in enumerate(n1)}
             name_to_idx2 = {name: i for i, name in enumerate(n2)}
 
-            # Iterate by official backbone atom order to ensure pairing
             for name in DOCKQ_BACKBONE_ATOMS:
                 if name in name_to_idx1 and name in name_to_idx2:
-                    coords1.append(c1[name_to_idx1[name]])
-                    coords2.append(c2[name_to_idx2[name]])
+                    idx1 = name_to_idx1[name]
+                    idx2 = name_to_idx2[name]
+                    coords1.append(c1[idx1])
+                    coords2.append(c2[idx2])
+                    valid1.append(v1[idx1])
+                    valid2.append(v2[idx2])
         else:
-            # Assume perfectly aligned, just filter by backbone atom names
             mask1 = np.isin(n1, DOCKQ_BACKBONE_ATOMS)
             coords1.extend(c1[mask1])
             coords2.extend(c2[mask1])
+            valid1.extend(v1[mask1])
+            valid2.extend(v2[mask1])
 
     if not coords1:
-        return np.zeros((0, 3)), np.zeros((0, 3))
-    return np.array(coords1), np.array(coords2)
+        return (
+            np.empty((0, 3)),
+            np.empty((0, 3)),
+            np.empty(0, dtype=bool),
+            np.empty(0, dtype=bool),
+        )
+    return np.array(coords1), np.array(coords2), np.array(valid1), np.array(valid2)
 
 
 def compute_dockq_for_pair(
@@ -292,11 +317,21 @@ def compute_dockq_for_pair(
     model_aln1_coords = [model_struct.atom_array.coord[s:e] for s, e in model_aln1]
     model_aln2_coords = [model_struct.atom_array.coord[s:e] for s, e in model_aln2]
 
+    # Identify valid residues in model (residues that have at least one valid atom)
+    model_res1_valid = np.array(
+        [np.any(model_struct.valid_mask[s:e]) for s, e in model_aln1]
+    )
+    model_res2_valid = np.array(
+        [np.any(model_struct.valid_mask[s:e]) for s, e in model_aln2]
+    )
+    # A contact is only valid if both residues are valid
+    model_res_contact_mask = model_res1_valid[:, None] & model_res2_valid[None, :]
+
     ref_aln_dist = _compute_residue_distances(ref_aln1_coords, ref_aln2_coords)
     model_aln_dist = _compute_residue_distances(model_aln1_coords, model_aln2_coords)
 
     ref_contacts = ref_aln_dist < FNAT_THRESHOLD**2
-    model_contacts = model_aln_dist < FNAT_THRESHOLD**2
+    model_contacts = (model_aln_dist < FNAT_THRESHOLD**2) & model_res_contact_mask
 
     nat_correct = np.sum(ref_contacts * model_contacts)
     model_total = np.sum(model_contacts)
@@ -315,26 +350,47 @@ def compute_dockq_for_pair(
     # Paired backbone atoms for interface residues of both chains
     ref_int_aln1 = [ref_aln1[i] for i in int_res_indices1]
     model_int_aln1 = [model_aln1[i] for i in int_res_indices1]
-    ref_int_coords1, model_int_coords1 = _get_paired_backbone_coords(
+    (
+        ref_int_coords1,
+        model_int_coords1,
+        ref_int_valid1,
+        model_int_valid1,
+    ) = _get_paired_backbone_coords(
         ref_struct, model_struct, ref_int_aln1, model_int_aln1, align_atoms=align_atoms
     )
 
     ref_int_aln2 = [ref_aln2[i] for i in int_res_indices2]
     model_int_aln2 = [model_aln2[i] for i in int_res_indices2]
-    ref_int_coords2, model_int_coords2 = _get_paired_backbone_coords(
+    (
+        ref_int_coords2,
+        model_int_coords2,
+        ref_int_valid2,
+        model_int_valid2,
+    ) = _get_paired_backbone_coords(
         ref_struct, model_struct, ref_int_aln2, model_int_aln2, align_atoms=align_atoms
     )
 
     ref_interface_atoms = np.concatenate([ref_int_coords1, ref_int_coords2])
     model_interface_atoms = np.concatenate([model_int_coords1, model_int_coords2])
+    ref_interface_valid = np.concatenate([ref_int_valid1, ref_int_valid2])
+    model_interface_valid = np.concatenate([model_int_valid1, model_int_valid2])
 
     if len(ref_interface_atoms) == 0:
         irmsd = 0.0
     else:
-        rot, trans = align_src_to_tar(model_interface_atoms, ref_interface_atoms)
-        irmsd = rmsd(
-            apply_transform(model_interface_atoms, rot, trans), ref_interface_atoms
-        )
+        interface_valid = model_interface_valid & ref_interface_valid
+        if not np.any(interface_valid):
+            irmsd = np.inf
+        else:
+            rot, trans = align_src_to_tar(
+                model_interface_atoms, ref_interface_atoms, atom_mask=interface_valid
+            )
+            irmsd = rmsd(
+                apply_transform(model_interface_atoms, rot, trans),
+                ref_interface_atoms,
+                valid_mask1=model_interface_valid,
+                valid_mask2=ref_interface_valid,
+            )
 
     # 4. LRMSD
     # Assign receptor and ligand by size (DockQ convention)
@@ -348,10 +404,20 @@ def compute_dockq_for_pair(
         class1, class2 = "ligand", "receptor"
 
     # Paired backbone atoms for entire chains
-    ref_rec_coords, model_rec_coords = _get_paired_backbone_coords(
+    (
+        ref_rec_coords,
+        model_rec_coords,
+        ref_rec_valid,
+        model_rec_valid,
+    ) = _get_paired_backbone_coords(
         ref_struct, model_struct, receptor_ref, receptor_model, align_atoms=align_atoms
     )
-    ref_lig_coords, model_lig_coords = _get_paired_backbone_coords(
+    (
+        ref_lig_coords,
+        model_lig_coords,
+        ref_lig_valid,
+        model_lig_valid,
+    ) = _get_paired_backbone_coords(
         ref_struct, model_struct, ligand_ref, ligand_model, align_atoms=align_atoms
     )
 
@@ -361,15 +427,28 @@ def compute_dockq_for_pair(
             "No common backbone atoms found in receptor for LRMSD calculation."
         )
     else:
-        rot_rec, trans_rec = align_src_to_tar(model_rec_coords, ref_rec_coords)
-        # Apply to ligand and compute RMSD
-        if len(ref_lig_coords) == 0:
-            raise ValueError(
-                "No common backbone atoms found in ligand for LRMSD calculation."
-            )
+        receptor_valid = model_rec_valid & ref_rec_valid
+        if not np.any(receptor_valid):
+            lrmsd = np.inf
         else:
-            model_lig_rotated = apply_transform(model_lig_coords, rot_rec, trans_rec)
-            lrmsd = rmsd(model_lig_rotated, ref_lig_coords)
+            rot_rec, trans_rec = align_src_to_tar(
+                model_rec_coords, ref_rec_coords, atom_mask=receptor_valid
+            )
+            # Apply to ligand and compute RMSD
+            if len(ref_lig_coords) == 0:
+                raise ValueError(
+                    "No common backbone atoms found in ligand for LRMSD calculation."
+                )
+            else:
+                model_lig_rotated = apply_transform(
+                    model_lig_coords, rot_rec, trans_rec
+                )
+                lrmsd = rmsd(
+                    model_lig_rotated,
+                    ref_lig_coords,
+                    valid_mask1=model_lig_valid,
+                    valid_mask2=ref_lig_valid,
+                )
 
     # DockQ Score formula
     def rms_scaled(rms, d):

@@ -14,11 +14,15 @@
 
 import copy
 import dataclasses
+import functools
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
+import biotite.structure as bs
 import numpy as np
 from biotite.structure import AtomArray, CellList
+from biotite.structure.info import residue
+from biotite.structure.info.ccd import get_from_ccd
 
 from pxmeter.constants import (
     CRYSTALLIZATION_AIDS,
@@ -35,6 +39,102 @@ from pxmeter.constants import (
 from pxmeter.data.parser import MMCIFParser
 from pxmeter.data.utils import get_unique_atom_id, get_unique_chain_id
 from pxmeter.data.writer import CIFWriter
+
+
+@functools.lru_cache(maxsize=None)
+def _get_leaving_groups(res_name: str) -> dict:
+    try:
+        names = get_from_ccd("chem_comp_atom", res_name, "atom_id").as_array()
+        flags = get_from_ccd(
+            "chem_comp_atom", res_name, "pdbx_leaving_atom_flag"
+        ).as_array()
+        a1 = get_from_ccd("chem_comp_bond", res_name, "atom_id_1").as_array()
+        a2 = get_from_ccd("chem_comp_bond", res_name, "atom_id_2").as_array()
+    except KeyError:
+        return {}
+
+    is_leave = dict(zip(names, flags == "Y"))
+    graph = {str(n): [] for n in names}
+    for u, v in zip(a1, a2):
+        graph[str(u)].append(str(v))
+        graph[str(v)].append(str(u))
+
+    central_to_leaving = {}
+    for atom in names:
+        if not is_leave.get(str(atom), False):
+            continue
+        q, visited, central = [str(atom)], {str(atom)}, None
+        while q:
+            curr = q.pop(0)
+            if not is_leave.get(curr, False):
+                central = curr
+                break
+            for nxt in graph.get(curr, []):
+                if nxt not in visited:
+                    visited.add(nxt)
+                    q.append(nxt)
+        if central:
+            central_to_leaving.setdefault(central, []).append(str(atom))
+    return central_to_leaving
+
+
+@functools.lru_cache(maxsize=None)
+def _get_ccd_residue_no_h(res_name: str):
+    try:
+        ccd_atoms = residue(res_name)
+    except KeyError:
+        return None
+    return ccd_atoms[~np.isin(ccd_atoms.element, ["H", "D"])]
+
+
+@functools.lru_cache(maxsize=None)
+def _get_remove_atom_names_by_pos(res_name, pos_type):
+    leaving = _get_leaving_groups(res_name)
+    remove = []
+    if pos_type in (1, 2):  # not N-term
+        remove.extend(leaving.get("N", []) + leaving.get("P", []))
+    if pos_type in (0, 1):  # not C-term
+        remove.extend(leaving.get("C", []) + leaving.get("O3'", []))
+    return remove
+
+
+def _get_remove_atom_names(res_name, res_id, seq_len):
+    # This is not easily cached if res_id varies, but we can cache
+    # based on position type: 0=N-term, 1=middle, 2=C-term
+    pos_type = 0 if res_id == 1 else (2 if res_id == seq_len else 1)
+    return _get_remove_atom_names_by_pos(res_name, pos_type)
+
+
+def _create_missing(
+    ccd_atoms, missing_names, chain_id, entity_id, res_id, res_name, template
+):
+    mask = np.isin(ccd_atoms.atom_name, missing_names)
+    if not np.any(mask):
+        return None
+    new_arr = ccd_atoms[mask].copy()
+    new_arr.coord[:] = 0.0
+
+    # Use faster annotation copy
+    new_cats = new_arr.get_annotation_categories()
+    temp_cats = template.get_annotation_categories()
+
+    for annot in temp_cats:
+        if annot not in new_cats:
+            new_arr.add_annotation(annot, dtype=template.get_annotation(annot).dtype)
+
+    if "res_id" in new_cats or "res_id" in temp_cats:
+        new_arr.res_id[:] = res_id
+    if "res_name" in new_cats or "res_name" in temp_cats:
+        new_arr.res_name[:] = res_name
+    if "chain_id" in new_cats or "chain_id" in temp_cats:
+        new_arr.chain_id[:] = chain_id
+    if "label_entity_id" in new_cats or "label_entity_id" in temp_cats:
+        new_arr.set_annotation("label_entity_id", np.array([entity_id] * len(new_arr)))
+
+    for annot in list(new_cats):
+        if annot not in temp_cats:
+            new_arr.del_annotation(annot)
+    return new_arr
 
 
 @dataclasses.dataclass
@@ -64,6 +164,12 @@ class Structure:
     entry_id: str = ""
     exptl_methods: tuple[str] = tuple()
     cif_block: dict = None
+    poly_res_names: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    valid_mask: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        if self.valid_mask is None:
+            self.valid_mask = np.ones(len(self.atom_array), dtype=bool)
 
     def __repr__(self):
         return f"Structure(atom_array={self.atom_array[:30]})"
@@ -108,6 +214,7 @@ class Structure:
             entry_id=cif_parser.entry_id,
             exptl_methods=tuple(cif_parser.exptl_methods),
             cif_block=cif_parser.cif.block,
+            poly_res_names=cif_parser.get_poly_res_names(atom_array),
         )
 
     @classmethod
@@ -119,6 +226,7 @@ class Structure:
         entry_id: str = "",
         exptl_methods: tuple[str] = tuple(),
         cif_block: dict = None,
+        poly_res_names: dict[str, list[str]] = None,
     ) -> "Structure":
         """
         Create a Structure object from MMCIF.
@@ -143,6 +251,7 @@ class Structure:
             entry_id=entry_id,
             exptl_methods=exptl_methods,
             cif_block=cif_block,
+            poly_res_names=poly_res_names or {},
         )
 
     def get_release_date(self) -> str:
@@ -413,11 +522,17 @@ class Structure:
             uni_chain_id = self.uni_chain_id[mask]
             uni_atom_id = self.uni_atom_id[mask]
 
+        if self.valid_mask is not None:
+            valid_mask = self.valid_mask[mask]
+        else:
+            valid_mask = np.ones(len(substructure_atom_array), dtype=bool)
+
         return dataclasses.replace(
             self,
             atom_array=substructure_atom_array,
             uni_chain_id=uni_chain_id,
             uni_atom_id=uni_atom_id,
+            valid_mask=valid_mask,
         )
 
     def get_chains_and_interfaces(
@@ -630,6 +745,300 @@ class Structure:
 
         return self.select_substructure(mask)
 
+    def add_missing_atoms(self):
+        """
+        Add missing residues and atoms for polymers in the Structure based on `entity_poly_seq` and CCD.
+        The coordinates of the newly added atoms will be set to (0, 0, 0).
+        Original atom order is preserved, and missing atoms are inserted at their correct sequence positions.
+        Also correctly maintains atomic bonds and removes terminal leaving atoms from intermediate residues.
+        """
+
+        starts = self.get_residue_starts(add_exclusive_stop=True)
+        if len(starts) <= 1:
+            return self
+
+        # Pre-compute all required CCD residues to avoid repeated lookups
+        unique_res_names = set()
+        for res_names_list in self.poly_res_names.values():
+            unique_res_names.update(res_names_list)
+
+        ccd_cache = {}
+        for r_name in unique_res_names:
+            ccd_cache[r_name] = _get_ccd_residue_no_h(r_name)
+
+        new_arrays, new_u_chains, new_u_atoms, new_valid_masks = [], [], [], []
+        last_processed_res_id, o2n_amap = {}, {}
+        new_global_start = 0
+
+        last_block_idx = {
+            self.uni_chain_id[starts[i]]: i for i in range(len(starts) - 1)
+        }
+
+        for i in range(len(starts) - 1):
+            start, stop = starts[i], starts[i + 1]
+            res_atoms = self.atom_array[start:stop]
+            chain_id, u_chain_id = res_atoms.chain_id[0], self.uni_chain_id[start]
+            res_id, entity_id = res_atoms.res_id[0], res_atoms.label_entity_id[0]
+
+            if entity_id in self.poly_res_names:
+                seq_list = self.poly_res_names[entity_id]
+                expected_id = last_processed_res_id.get(u_chain_id, 0) + 1
+
+                def add_missing_res(start_id, end_id):
+                    nonlocal new_global_start
+                    for eid in range(start_id, end_id):
+                        if eid > len(seq_list):
+                            break
+                        ename = seq_list[eid - 1]
+                        ccd_atoms = ccd_cache.get(ename)
+                        if ccd_atoms is not None:
+                            rm_names = _get_remove_atom_names(ename, eid, len(seq_list))
+                            missing = [
+                                n for n in ccd_atoms.atom_name if n not in rm_names
+                            ]
+                            arr = _create_missing(
+                                ccd_atoms,
+                                missing,
+                                chain_id,
+                                entity_id,
+                                eid,
+                                ename,
+                                self.atom_array,
+                            )
+                            if arr is not None:
+                                new_arrays.append(arr)
+                                new_u_chains.extend([u_chain_id] * len(arr))
+                                new_u_atoms.extend(
+                                    [f"{eid}_{ename}_{n}" for n in arr.atom_name]
+                                )
+                                new_valid_masks.append(np.zeros(len(arr), dtype=bool))
+                                new_global_start += len(arr)
+
+                # 1. Fill missing residues before current res_id
+                add_missing_res(expected_id, res_id)
+
+                # 2. Append current residue's existing atoms (filtered)
+                ename = (
+                    seq_list[res_id - 1]
+                    if res_id <= len(seq_list)
+                    else res_atoms.res_name[0]
+                )
+                rm_names = _get_remove_atom_names(ename, res_id, len(seq_list))
+                keep_mask = ~np.isin(res_atoms.atom_name, rm_names)
+                filtered_atoms = res_atoms[keep_mask]
+
+                # 2. Add current residue's existing atoms (filtered) and missing atoms in CCD order
+                if res_id <= len(seq_list):
+                    ccd_atoms = ccd_cache.get(ename)
+                else:
+                    ccd_atoms = None
+
+                if ccd_atoms is not None:
+                    # CCD defines the target atomic order
+                    target_names = [n for n in ccd_atoms.atom_name if n not in rm_names]
+
+                    missing_names = [
+                        n for n in target_names if n not in filtered_atoms.atom_name
+                    ]
+                    missing_arr = _create_missing(
+                        ccd_atoms,
+                        missing_names,
+                        chain_id,
+                        entity_id,
+                        res_id,
+                        ename,
+                        self.atom_array,
+                    )
+
+                    # Merge existing and missing atoms following target_names order
+                    if missing_arr is not None or len(filtered_atoms) > 0:
+                        merged_arrays = []
+                        merged_u_chains = []
+                        merged_u_atoms = []
+                        merged_valid_masks = []
+
+                        orig_offsets = np.where(keep_mask)[0]
+                        orig_name_to_idx = {
+                            n: i for i, n in enumerate(filtered_atoms.atom_name)
+                        }
+                        missing_name_to_idx = (
+                            {n: i for i, n in enumerate(missing_arr.atom_name)}
+                            if missing_arr is not None
+                            else {}
+                        )
+
+                        for name in target_names:
+                            if name in orig_name_to_idx:
+                                idx = orig_name_to_idx[name]
+                                merged_arrays.append(filtered_atoms[idx : idx + 1])
+                                merged_u_chains.append(
+                                    self.uni_chain_id[start:stop][keep_mask][idx]
+                                )
+                                merged_u_atoms.append(
+                                    self.uni_atom_id[start:stop][keep_mask][idx]
+                                )
+                                if self.valid_mask is not None:
+                                    merged_valid_masks.append(
+                                        self.valid_mask[start:stop][keep_mask][idx]
+                                    )
+                                else:
+                                    merged_valid_masks.append(True)
+
+                                o2n_amap[start + orig_offsets[idx]] = new_global_start
+                            elif name in missing_name_to_idx:
+                                idx = missing_name_to_idx[name]
+                                merged_arrays.append(missing_arr[idx : idx + 1])
+                                merged_u_chains.append(u_chain_id)
+                                merged_u_atoms.append(f"{res_id}_{ename}_{name}")
+                                merged_valid_masks.append(False)
+                            new_global_start += 1
+
+                        # Note: we might have existing atoms that are NOT in CCD but also NOT removed by rm_names.
+                        # Usually this shouldn't happen for standard residues, but just in case, append them at the end.
+                        extra_names = [
+                            n for n in filtered_atoms.atom_name if n not in target_names
+                        ]
+                        for name in extra_names:
+                            idx = orig_name_to_idx[name]
+                            merged_arrays.append(filtered_atoms[idx : idx + 1])
+                            merged_u_chains.append(
+                                self.uni_chain_id[start:stop][keep_mask][idx]
+                            )
+                            merged_u_atoms.append(
+                                self.uni_atom_id[start:stop][keep_mask][idx]
+                            )
+                            if self.valid_mask is not None:
+                                merged_valid_masks.append(
+                                    self.valid_mask[start:stop][keep_mask][idx]
+                                )
+                            else:
+                                merged_valid_masks.append(True)
+
+                            o2n_amap[start + orig_offsets[idx]] = new_global_start
+                            new_global_start += 1
+
+                        if merged_arrays:
+                            merged_arr_all = merged_arrays[0]
+                            for arr in merged_arrays[1:]:
+                                merged_arr_all += arr
+                            new_arrays.append(merged_arr_all)
+                            new_u_chains.extend(merged_u_chains)
+                            new_u_atoms.extend(merged_u_atoms)
+                            new_valid_masks.append(
+                                np.array(merged_valid_masks, dtype=bool)
+                            )
+                else:
+                    # Fallback for non-standard residues or when ccd_atoms is not found
+                    if len(filtered_atoms) > 0:
+                        new_arrays.append(filtered_atoms)
+                        new_u_chains.extend(self.uni_chain_id[start:stop][keep_mask])
+                        new_u_atoms.extend(self.uni_atom_id[start:stop][keep_mask])
+                        if self.valid_mask is not None:
+                            new_valid_masks.append(
+                                self.valid_mask[start:stop][keep_mask]
+                            )
+                        else:
+                            new_valid_masks.append(
+                                np.ones(len(filtered_atoms), dtype=bool)
+                            )
+                        for orig_offset, new_offset in zip(
+                            np.where(keep_mask)[0], range(len(filtered_atoms))
+                        ):
+                            o2n_amap[start + orig_offset] = (
+                                new_global_start + new_offset
+                            )
+                        new_global_start += len(filtered_atoms)
+
+                last_processed_res_id[u_chain_id] = res_id
+
+                # 4. Flush trailing missing residues
+                if i == last_block_idx[u_chain_id]:
+                    add_missing_res(res_id + 1, len(seq_list) + 1)
+            else:
+                # Non-polymer
+                new_arrays.append(res_atoms)
+                new_u_chains.extend(self.uni_chain_id[start:stop])
+                new_u_atoms.extend(self.uni_atom_id[start:stop])
+                if self.valid_mask is not None:
+                    new_valid_masks.append(self.valid_mask[start:stop])
+                else:
+                    new_valid_masks.append(np.ones(len(res_atoms), dtype=bool))
+                for orig_offset, new_offset in zip(
+                    range(len(res_atoms)), range(len(res_atoms))
+                ):
+                    o2n_amap[start + orig_offset] = new_global_start + new_offset
+                new_global_start += len(res_atoms)
+
+        if new_arrays:
+            # Flatten AtomArrays
+            new_arr_all = new_arrays[0]
+            for arr in new_arrays[1:]:
+                new_arr_all += arr
+
+            # Map bonds
+            if self.atom_array.bonds is not None:
+                old_bonds = self.atom_array.bonds.as_array()
+                o2n_arr = np.full(len(self.atom_array), -1, dtype=int)
+                o2n_arr[list(o2n_amap.keys())] = list(o2n_amap.values())
+                valid_mask = (o2n_arr[old_bonds[:, 0]] != -1) & (
+                    o2n_arr[old_bonds[:, 1]] != -1
+                )
+                filtered_bonds = old_bonds[valid_mask]
+                mapped_bonds = np.zeros_like(filtered_bonds)
+                mapped_bonds[:, 0], mapped_bonds[:, 1], mapped_bonds[:, 2] = (
+                    o2n_arr[filtered_bonds[:, 0]],
+                    o2n_arr[filtered_bonds[:, 1]],
+                    filtered_bonds[:, 2],
+                )
+                new_arr_all.bonds = bs.BondList(len(new_arr_all), mapped_bonds)
+
+            self.atom_array = new_arr_all
+            self.uni_chain_id = np.array(new_u_chains)
+            self.uni_atom_id = np.array(new_u_atoms)
+            self.valid_mask = np.concatenate(new_valid_masks)
+
+            # Add inter-residue bonds
+            new_starts = self.get_residue_starts(add_exclusive_stop=True)
+            new_inter_bonds = set()
+            for i in range(len(new_starts) - 2):
+                start, stop = new_starts[i], new_starts[i + 1]
+                nxt_start, nxt_stop = new_starts[i + 1], new_starts[i + 2]
+                if (
+                    self.atom_array.chain_id[start]
+                    == self.atom_array.chain_id[nxt_start]
+                    and self.atom_array.res_id[nxt_start]
+                    == self.atom_array.res_id[start] + 1
+                ):
+                    c_idx = np.where(
+                        np.isin(self.atom_array.atom_name[start:stop], ["C", "O3'"])
+                    )[0]
+                    n_idx = np.where(
+                        np.isin(
+                            self.atom_array.atom_name[nxt_start:nxt_stop], ["N", "P"]
+                        )
+                    )[0]
+                    if len(c_idx) > 0 and len(n_idx) > 0:
+                        abs_c, abs_n = start + c_idx[0], nxt_start + n_idx[0]
+                        if (
+                            self.atom_array.bonds is not None
+                            and abs_n in self.atom_array.bonds.get_bonds(abs_c)[0]
+                        ):
+                            continue
+                        new_inter_bonds.add((abs_c, abs_n, 1))
+
+            if new_inter_bonds:
+                bonds_to_merge = bs.BondList(
+                    len(self.atom_array),
+                    np.array(list(new_inter_bonds), dtype=np.uint32),
+                )
+                self.atom_array.bonds = (
+                    bonds_to_merge
+                    if self.atom_array.bonds is None
+                    else self.atom_array.bonds.merge(bonds_to_merge)
+                )
+
+        return self
+
     def to_cif(
         self,
         output_cif: Union[str, Path],
@@ -655,7 +1064,10 @@ class Structure:
             atom_array.del_annotation("chain_id")
             atom_array.set_annotation("chain_id", self.uni_chain_id)
 
-        cif_writer = CIFWriter(atom_array, self.entity_poly_type)
+        cif_writer = CIFWriter(
+            atom_array, self.entity_poly_type, atom_array_output_mask=self.valid_mask
+        )
+
         cif_writer.save_to_cif(
             output_cif, entry_id=self.entry_id, include_bonds=include_bonds
         )

@@ -31,12 +31,15 @@ RUN_CONFIG = ConfigDict(
             "calc_dockq": True,
             "calc_rmsd": True,
             "calc_pb_valid": True,
+            "calc_cdr_h3_bb_rmsd": False,
+            "penalize_unmapped_reference_atoms": False,
             "lddt": {
                 "eps": 1e-6,
                 "nucleotide_threshold": 30.0,
                 "non_nucleotide_threshold": 15.0,
                 "stereochecks": False,
                 "calc_backbone_lddt": True,
+                "calc_lddt_pli": True,
             },
             "dockq": {
                 "exclude_hetatms": True,
@@ -349,6 +352,26 @@ Typical use cases:
 - Enable this when benchmarking antibody structure prediction models.
 - Keep disabled for general protein complexes to save runtime (avoids ANARCII annotation overhead).
 
+#### 3.1.7 `metric.penalize_unmapped_reference_atoms` (bool)
+
+**Default:** `False`
+
+Controls how unmapped reference atoms (atoms in the reference structure that have no equivalent in the model structure) are treated across various metrics.
+
+- When `True`, PXMeter:
+  - Pads the model structure with dummy representations (`0.0` coordinates) for all reference atoms that could not be mapped to the model.
+  - Handles these missing atoms in downstream metrics:
+    - **LDDT**: Missing atoms fail the distance pair checks, lowering the final LDDT score (as the denominator remains the full reference set).
+    - **RMSD (iRMSD/LRMSD)**: Missing atoms are **ignored** during both the structural alignment (superposition) and the final RMSD calculation. This allows you to see the geometric accuracy of the predicted parts without being blocked by `inf` values.
+    - **DockQ**: This composite score is penalized via its component **fnat** (Fraction of Native Contacts), where missing residues are treated as having **no contacts**. Consequently, native contacts involving missing residues are marked as "not recovered", lowering the score. Its RMSD components (`iRMSD` and `LRMSD`) follow the same "ignore missing atoms" logic as above.
+    - **PoseBusters**: Missing atoms in the **receptor** are ignored (to avoid fake clashes). Missing atoms in the **ligand** cause the ligand to immediately fail all validation checks (`False`).
+- When `False`, unmapped reference atoms are simply ignored in all metric calculations. The model is evaluated purely on the subset of atoms it successfully predicted, and the denominators for scores like LDDT/fnat are reduced to only include mapped atoms.
+
+Typical use cases:
+
+- Enable this when you want a strict evaluation that penalizes models for dropping atoms or entire chains from the reference.
+- Keep disabled if you only care about the geometric accuracy of the atoms the model *did* produce.
+
 ---
 
 ## 4. LDDT-specific configuration (`metric.lddt`)
@@ -445,6 +468,24 @@ Typical use cases:
   sensitive to side-chain modelling.
 - Disable when you only care about all-atom LDDT or want to minimise the number
   of reported metrics.
+
+### 4.6 `metric.lddt.calc_lddt_pli` (bool)
+
+**Default:** `True`
+
+Controls whether PXMeter computes the **Protein-Ligand Interface LDDT (LDDT-PLI)** for protein-ligand interactions.
+
+- When `True`:
+  - PXMeter computes an LDDT specifically focused on the ligand and its surrounding protein environment.
+  - The calculation measures the conservation of interatomic distances between the ligand atoms and nearby protein pocket atoms.
+  - The results are reported at the ligand-interface level.
+- When `False`:
+  - The specific LDDT-PLI calculation is skipped, though standard complex-level or all-atom LDDT computations may still capture ligand atoms based on other settings.
+
+Typical use cases:
+
+- Keep enabled for drug discovery or binding pose evaluations where the local geometry of the ligand binding site is critical.
+- Disable if your target is a pure protein/nucleic acid complex and contains no relevant small-molecule ligands, saving computation time.
 
 ---
 

@@ -241,7 +241,33 @@ class ResiduePermutation:
             model_mat = model_centers[ordered]
 
             transformed = apply_transform(model_mat, rot, trans)
-            v = rmsd(transformed, ref_centers)
+
+            vmask1 = None
+            vmask2 = None
+
+            # Compute residue-level valid mask if available
+            if self.model_struct.valid_mask is not None:
+                # ids is the permuted indices for model
+                # chain_mask is the mask for the chain in model_struct
+                model_valid = self.model_struct.valid_mask[chain_mask]
+                res_ids_for_mask = self.model_struct.atom_array.res_id[chain_mask]
+                uniq_ids_v, inv_v = np.unique(res_ids_for_mask, return_inverse=True)
+                vmask1 = np.bincount(inv_v, weights=model_valid) > 0
+
+            if self.ref_struct.valid_mask is not None:
+                ref_valid = self.ref_struct.valid_mask[chain_mask]
+                res_ids_for_mask = self.ref_struct.atom_array.res_id[chain_mask]
+                uniq_ids_v, inv_v = np.unique(res_ids_for_mask, return_inverse=True)
+                vmask2 = np.bincount(inv_v, weights=ref_valid) > 0
+
+            # Note: since p permutes the residue sequence, we need to permute vmask1
+            if vmask1 is not None:
+                vmask1_p = vmask1[ordered]
+            else:
+                vmask1_p = None
+
+            v = rmsd(transformed, ref_centers, valid_mask1=vmask1_p, valid_mask2=vmask2)
+
             if v < best_rmsd:
                 best_rmsd = v
                 best_perm = ids

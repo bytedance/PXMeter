@@ -34,6 +34,7 @@ RUN_CONFIG = ConfigDict(
             "calc_rmsd": True,
             "calc_pb_valid": True,
             "calc_cdr_h3_bb_rmsd": False,
+            "penalize_unmapped_reference_atoms": False,
             "lddt": {
                 "eps": 1e-6,
                 "nucleotide_threshold": 30.0,

@@ -682,7 +682,6 @@ class ChainPermutation:
 
         ref_indices = np.array(ref_indices)
         model_indices = np.array(model_indices)
-
         assert np.all(
             self.ref_struct.uni_atom_id[ref_indices]
             == self.model_struct.uni_atom_id[model_indices]

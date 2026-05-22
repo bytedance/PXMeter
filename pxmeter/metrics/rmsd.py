@@ -38,12 +38,14 @@ def align_src_to_tar(
         rot: optimal rotation matrix
         translate: optimal translation vector
     """
+    # Ignore missing atoms coordinates when computing transformation (indicated by valid mask)
     if atom_mask is not None:
         atom_mask = atom_mask.astype(float)
-        src_pose = src_pose * atom_mask[..., None]
-        tar_pose = tar_pose * atom_mask[..., None]
     else:
         atom_mask = np.ones(src_pose.shape[:-1], dtype=float)
+
+    src_pose = src_pose * atom_mask[..., None]
+    tar_pose = tar_pose * atom_mask[..., None]
 
     if weight is None:
         weight = atom_mask
@@ -100,6 +102,8 @@ def rmsd(
     mask: np.ndarray = None,
     eps: float = 0.0,
     reduce: bool = True,
+    valid_mask1: Optional[np.ndarray] = None,
+    valid_mask2: Optional[np.ndarray] = None,
 ):
     """
     Compute RMSD between two poses, with the same shape.
@@ -121,10 +125,21 @@ def rmsd(
     else:
         mask = mask.astype(float)
 
+    # Update mask with valid masks if provided to ignore missing atoms
+    if valid_mask1 is not None:
+        mask = mask * valid_mask1
+    if valid_mask2 is not None:
+        mask = mask * valid_mask2
+
     # Compute squared error.
+    mask_sum = mask.sum(axis=-1)
     err2 = (np.square(pose1 - pose2).sum(axis=-1) * mask).sum(axis=-1) / (
-        mask.sum(axis=-1) + eps
+        mask_sum + eps
     )
+
+    # If no atoms were valid for a batch element, set to infinity only if eps is 0
+    if eps == 0:
+        err2 = np.where(mask_sum > 0, err2, np.inf)
 
     # Calculate RMSD with added epsilon tolerance.
     rmsd_value = np.sqrt(err2 + eps)
@@ -145,6 +160,8 @@ def partially_aligned_rmsd(
     eps: float = 0.0,
     reduce: bool = True,
     allow_reflection: bool = False,
+    src_valid_mask: Optional[np.ndarray] = None,
+    tar_valid_mask: Optional[np.ndarray] = None,
 ):
     """
     RMSD when aligning parts of the complex coordinate,
@@ -166,6 +183,11 @@ def partially_aligned_rmsd(
         rot (np.ndarray): optimal rotation matrix
         translate (np.ndarray): optimal translation vector
     """
+    if src_valid_mask is not None:
+        align_mask = align_mask * src_valid_mask
+    if tar_valid_mask is not None:
+        align_mask = align_mask * tar_valid_mask
+
     rot, translate = align_src_to_tar(
         src_pose,
         tar_pose,
@@ -175,9 +197,21 @@ def partially_aligned_rmsd(
     )
     transformed_src_pose = apply_transform(src_pose, rot, translate)
     rmsd_value = rmsd(
-        transformed_src_pose, tar_pose, mask=rmsd_mask, eps=eps, reduce=reduce
+        transformed_src_pose,
+        tar_pose,
+        mask=rmsd_mask,
+        eps=eps,
+        reduce=reduce,
+        valid_mask1=src_valid_mask,
+        valid_mask2=tar_valid_mask,
     )
     aligned_part_rmsd = rmsd(
-        transformed_src_pose, tar_pose, mask=align_mask, eps=eps, reduce=reduce
+        transformed_src_pose,
+        tar_pose,
+        mask=align_mask,
+        eps=eps,
+        reduce=reduce,
+        valid_mask1=src_valid_mask,
+        valid_mask2=tar_valid_mask,
     )
     return aligned_part_rmsd, rmsd_value, rot, translate

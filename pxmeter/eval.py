@@ -60,6 +60,9 @@ def evaluate(
         MetricResult: An object containing the evaluation results.
     """
 
+    run_config.mapping.penalize_unmapped_reference_atoms = (
+        run_config.metric.penalize_unmapped_reference_atoms
+    )
     map_result = MappingResult.from_cifs(
         ref_cif=ref_cif,
         model_cif=model_cif,

@@ -240,12 +240,64 @@ class AtomPermutation:
         ) = self._prepare_coord_and_mask_for_perm(
             atom_perm_list, transformed_model_coord
         )
+
+        max_perm = max([i.shape[1] for i in atom_perm_list])
+        max_atom = max([i.shape[0] for i in atom_perm_list])
+
+        ref_valid_for_perm = []
+        model_valid_for_perm = []
+
+        starts = self.ref_struct.get_residue_starts(add_exclusive_stop=True)
+        for res_idx, (res_start, res_stop) in enumerate(zip(starts[:-1], starts[1:])):
+            res_perm_array = atom_perm_list[res_idx]
+            ref_res_atom_num = res_stop - res_start
+
+            ref_res_valid = (
+                self.ref_struct.valid_mask[res_start:res_stop]
+                if self.ref_struct.valid_mask is not None
+                else np.ones(ref_res_atom_num, dtype=bool)
+            )
+            model_res_valid = (
+                self.model_struct.valid_mask[res_start:res_stop]
+                if self.model_struct.valid_mask is not None
+                else np.ones(ref_res_atom_num, dtype=bool)
+            )
+
+            padded_ref_valid = np.zeros(max_atom, dtype=bool)
+            padded_ref_valid[:ref_res_atom_num] = ref_res_valid
+
+            padded_model_valid = np.zeros(max_atom, dtype=bool)
+            padded_model_valid[:ref_res_atom_num] = model_res_valid
+
+            ref_res_valid_perm = []
+            model_res_valid_perm = []
+
+            for i in range(max_perm):
+                ref_res_valid_perm.append(padded_ref_valid)
+                if i < res_perm_array.shape[1]:
+                    perm_index = res_perm_array.T[i]
+                    padded_model_valid_copy = padded_model_valid.copy()
+                    padded_model_valid_copy[:ref_res_atom_num] = model_res_valid[
+                        perm_index
+                    ]
+                    model_res_valid_perm.append(padded_model_valid_copy)
+                else:
+                    model_res_valid_perm.append(padded_model_valid)
+
+            ref_valid_for_perm.append(ref_res_valid_perm)
+            model_valid_for_perm.append(model_res_valid_perm)
+
+        ref_valid_for_perm = np.array(ref_valid_for_perm)
+        model_valid_for_perm = np.array(model_valid_for_perm)
+
         rmsd_for_res_and_perm = rmsd(
             model_coord_for_perm,
             ref_coord_for_perm,
             mask=rmsd_mask,
             reduce=False,
             eps=1e-6,
+            valid_mask1=model_valid_for_perm,
+            valid_mask2=ref_valid_for_perm,
         )
 
         curr_atom_idx = 0
