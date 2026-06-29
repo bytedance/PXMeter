@@ -429,7 +429,11 @@ def calc_mmseqs_seq_identity(
             shell=True,
             check=True,
         )
-        df = pd.read_csv(tmp_dir / "test_vs_train.tsv", sep="\t", header=None)
+        output_path = tmp_dir / "test_vs_train.tsv"
+        if output_path.stat().st_size == 0:
+            df = pd.DataFrame()
+        else:
+            df = pd.read_csv(output_path, sep="\t", header=None)
 
         for _, row in df.iterrows():
             query_id = row[0]
@@ -579,7 +583,7 @@ def make_lowh_parquet_file(
     )
 
     rna_test_vs_train = get_lowh_by_mmseqs_seq_identity(
-        df[df["entity_type"] == DNA],
+        df[df["entity_type"] == RNA],
         after_date,
         before_date,
         threshold=0.8,
@@ -592,7 +596,7 @@ def make_lowh_parquet_file(
     )
 
     dna_test_vs_train = get_lowh_by_mmseqs_seq_identity(
-        df[df["entity_type"] == RNA],
+        df[df["entity_type"] == DNA],
         after_date,
         before_date,
         threshold=0.8,

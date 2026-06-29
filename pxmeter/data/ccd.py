@@ -48,7 +48,8 @@ def get_ccd_one_letter_code(res_name):
     Returns:
         str: The corresponding one-letter amino acid code if available, otherwise an empty string or None.
     """
-    one = get_from_ccd("chem_comp", res_name, "one_letter_code").as_item()
+    one = get_from_ccd("chem_comp", res_name, "one_letter_code")
+    one = None if one is None else one.as_item()
     return one
 
 
