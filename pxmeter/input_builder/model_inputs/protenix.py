@@ -272,7 +272,10 @@ class ProtenixInput:
                 seqs_to_entities[seq].count += 1
                 seqs_to_entities[seq].add_ori_chain_id(chain_id)
                 copy_id = len(seqs_to_entities[seq].ori_chain_ids)
-                chain_to_entity_and_copy[seq_idx] = (entity_id, copy_id)
+                chain_to_entity_and_copy[seq_idx] = (
+                    seqs_to_entities[seq].entity_id,
+                    copy_id,
+                )
 
         bonds = []
         for bond in sequences.bonds:

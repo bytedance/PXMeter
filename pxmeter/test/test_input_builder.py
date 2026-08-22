@@ -18,8 +18,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pxmeter.constants import PROTEIN
 from pxmeter.input_builder.gen_input import run_gen_input
-from pxmeter.input_builder.seq import Sequences
+from pxmeter.input_builder.seq import Bond, PolymerChainSequence, Sequences
 from pxmeter.test.test_utils import TEST_DATA_DIR
 
 
@@ -160,6 +161,43 @@ class TestInputBuilder(unittest.TestCase):
         )
         # Bond count should be preserved
         self.assertEqual(len(seqs_from_cif.bonds), len(seqs_roundtrip.bonds))
+
+    def test_protenix_maps_non_contiguous_duplicate_chain_to_existing_entity(self):
+        """A repeated sequence should retain its original entity ID in bonds."""
+        from pxmeter.input_builder.model_inputs.protenix import ProtenixInput
+
+        first_a = PolymerChainSequence(
+            sequence="AA", entity_type=PROTEIN, ori_chain_id="A"
+        )
+        chain_b = PolymerChainSequence(
+            sequence="GG", entity_type=PROTEIN, ori_chain_id="B"
+        )
+        second_a = PolymerChainSequence(
+            sequence="AA", entity_type=PROTEIN, ori_chain_id="C"
+        )
+        sequences = Sequences(
+            name="non_contiguous_duplicate",
+            sequences=(first_a, chain_b, second_a),
+            bonds=(
+                Bond(
+                    chain_index_1=2,
+                    res_id_1=1,
+                    atom_name_1="CA",
+                    chain_index_2=0,
+                    res_id_2=1,
+                    atom_name_2="N",
+                ),
+            ),
+        )
+
+        px_input = ProtenixInput.from_sequences(sequences, seeds=[0])
+
+        self.assertEqual(px_input.sequences[0].entity_id, 1)
+        self.assertEqual(px_input.sequences[0].count, 2)
+        self.assertEqual(px_input.bonds[0].entity_id_1, 1)
+        self.assertEqual(px_input.bonds[0].copy_id_1, 2)
+        self.assertEqual(px_input.bonds[0].entity_id_2, 1)
+        self.assertEqual(px_input.bonds[0].copy_id_2, 1)
 
     def test_boltz_memory_yaml_roundtrip(self):
         """Use real CIF to test in-memory Boltz YAML roundtrip.
