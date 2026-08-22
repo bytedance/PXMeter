@@ -815,6 +815,7 @@ def shrink_dataframe(
 
         s = out[col]
         old_dtype = s.dtype
+        is_text_dtype = s.dtype == "object" or isinstance(s.dtype, pd.StringDtype)
 
         # 1) Boolean casting: recognize 0/1 (non-float) or existing bools.
         if bool_cast:
@@ -840,8 +841,8 @@ def shrink_dataframe(
                 changes[col] = (old_dtype, out[col].dtype)
                 continue
 
-        # 3) Nullable integers for integer-like object columns.
-        elif use_nullable_int and s.dtype == "object":
+        # 3) Nullable integers for integer-like text columns.
+        elif use_nullable_int and is_text_dtype:
             sample = s.sample(min(len(s), 5000), random_state=0)
             try_parse = pd.to_numeric(sample, errors="coerce", downcast="integer")
             if (
@@ -867,7 +868,7 @@ def shrink_dataframe(
                 continue
 
         # 4) Text handling: low-cardinality -> category; otherwise -> string.
-        if s.dtype == "object":
+        if is_text_dtype:
             nunq = s.nunique(dropna=True)
             if nunq <= cat_threshold or nunq <= len(s) * cat_ratio:
                 out[col] = s.astype("category")

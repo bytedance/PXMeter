@@ -154,6 +154,22 @@ class TestUtils(unittest.TestCase):
         # str_col cardinality is high, so it shouldn't be category
         self.assertNotIsInstance(shrunk_df["str_col"].dtype, pd.CategoricalDtype)
 
+    def test_shrink_dataframe_string_dtype(self):
+        """StringDtype columns should receive the same text conversions as object."""
+        df = pd.DataFrame(
+            {
+                "int_col": pd.Series(["1", "2", pd.NA, "3"], dtype="string"),
+                "cat_col": pd.Series(["A", "B", "A", "B"], dtype="string"),
+                "str_col": pd.Series(["A", "B", "C", "D"], dtype="string"),
+            }
+        )
+
+        shrunk_df, _ = shrink_dataframe(df, cat_threshold=2, cat_ratio=0)
+
+        self.assertEqual(shrunk_df["int_col"].dtype, "Int8")
+        self.assertIsInstance(shrunk_df["cat_col"].dtype, pd.CategoricalDtype)
+        self.assertIsInstance(shrunk_df["str_col"].dtype, pd.StringDtype)
+
     def test_shrink_dataframe_exclude(self):
         """Test that excluded columns are not modified."""
         df = pd.DataFrame({"float_col": [1.1, 2.2, 3.3], "exclude_me": [1.1, 2.2, 3.3]})
