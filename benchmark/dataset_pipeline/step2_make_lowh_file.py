@@ -398,7 +398,7 @@ def calc_mmseqs_seq_identity(
     for seq, query_id in query_short_id:
         if id_in_db := db_short_seq_to_id.get(seq):
             # id, sequence identity
-            query_vs_db.append([query_id, id_in_db[0], 1.0, 0])
+            query_vs_db.extend([[query_id, db_id, 1.0, 0] for db_id in id_in_db])
 
     SRC_DATA_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=SRC_DATA_DIR) as tmp_dir:
