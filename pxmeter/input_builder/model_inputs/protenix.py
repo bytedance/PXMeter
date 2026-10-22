@@ -497,7 +497,10 @@ class ProtenixInput:
         covalent_bonds: list[dict], all_entity_counts: dict[str, int]
     ) -> list[dict]:
         """
-        Merge covalent bonds with same entity and position.
+        Merge covalent bonds with the same entity and position.
+
+        Copy IDs are omitted only for complete identity pairings, which expand
+        back to the same pairs when loaded from JSON.
 
         Args:
             covalent_bonds (list[dict]): A list of covalent bond dicts.
@@ -526,7 +529,14 @@ class ProtenixInput:
         for k, v in bonds_recorder.items():
             left_counts = bonds_entity_counts[k][0]
             right_counts = bonds_entity_counts[k][1]
-            if left_counts == right_counts == len(v):
+            copy_pairs = {(bond["copy1"], bond["copy2"]) for bond in v}
+            identity_copy_pairs = {
+                (copy_id, copy_id) for copy_id in range(1, left_counts + 1)
+            }
+            if (
+                left_counts == right_counts == len(v)
+                and copy_pairs == identity_copy_pairs
+            ):
                 bond_dict_copy = copy.deepcopy(v[0])
                 del bond_dict_copy["copy1"]
                 del bond_dict_copy["copy2"]
